@@ -1,0 +1,13 @@
+/target/
+
+.DS_Store
+
+/node_modules/
+
+/pkg/
+
+.idea/
+
+.vscode/
+
+.env

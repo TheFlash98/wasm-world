@@ -1,0 +1,8 @@
+[package]
+name = "wasmtime_test"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+wasmtime = "19.0.0"
+anyhow = "1.0"
