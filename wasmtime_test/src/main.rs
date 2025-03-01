@@ -111,7 +111,7 @@ fn log_struct(mut caller: Caller<'_, ()>, ptr: i32, len: i32) {
         },
         None => "pointer/length out of bounds",
     };
-    let deserialized: Example = serde_json::from_str(&serialized).unwrap();
+    let deserialized: Example = ron::from_str(&serialized).unwrap();
     println!("deserialized = {:?}", deserialized.field1);
     println!("deserialized = {:?}", deserialized.field2);
     println!("deserialized = {:?}", deserialized.field3);

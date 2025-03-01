@@ -67,9 +67,9 @@ pub fn send_example_to_host() {
         field3: [1., 2., 3., 4.]
     };
 
-    let example_json = serde_json::to_string(&example).unwrap();
+    let example_ron = ron::to_string(&example).unwrap();
     unsafe {
-        log_struct(example_json.as_ptr() as i32, example_json.len() as i32);
+        log_struct(example_ron.as_ptr() as i32, example_ron.len() as i32);
     }
 }
 
