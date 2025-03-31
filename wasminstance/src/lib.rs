@@ -114,7 +114,8 @@ fn init(id: i32) {
     };
     unsafe {
         INSTANCE = Some(instance);
-        if let Some(instance) = &mut INSTANCE {
+        let raw_ptr = &raw mut INSTANCE;
+        if let Some(instance) = &mut *raw_ptr {
             instance.init();
         }
     }
@@ -123,7 +124,8 @@ fn init(id: i32) {
 #[no_mangle]
 pub extern "C" fn get_instance() -> i32 {
     unsafe {
-        if let Some(instance) = &INSTANCE {
+        let raw_ptr = &raw const INSTANCE;
+        if let Some(instance) = &*raw_ptr {
             return instance.id;
         }
     }
@@ -133,7 +135,8 @@ pub extern "C" fn get_instance() -> i32 {
 #[no_mangle]
 pub extern "C" fn receive(ptr: i32, len: i32) {
     unsafe {
-        if let Some(instance) = &mut INSTANCE {
+        let raw_ptr = &raw mut INSTANCE;
+        if let Some(instance) = &mut *raw_ptr {
             instance.receive(ptr, len);
         }
     }
