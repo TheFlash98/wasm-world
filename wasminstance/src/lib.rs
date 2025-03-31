@@ -10,7 +10,6 @@ extern "C" {
     fn double(x: i32) -> i32;
     fn log_str(ptr: i32, len: i32);
     fn log_struct(ptr: i32, len: i32);
-    // fn send_message(target_id: i32, ptr: i32, len: i32);
     fn send_message(target_id: i32, ptr: i32, len: i32);
 }
 
