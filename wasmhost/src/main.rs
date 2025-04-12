@@ -234,63 +234,6 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
     }).join().unwrap();
 
-    // let instance = wasm_instance.instance;
-    // let memory = wasm_instance.memory;
-    
-
-    // println!("Memory data size: {:?}", memory.data_size(&store));
-    // println!("Memory size: {:?}", memory.size(&store));
-    // println!("State hash map: {:?}", context.state.lock().unwrap().instances);    
-    // let send = instance.get_func(&mut store, "send")
-    //     .expect("send was not an exported function");
-    // let send = send.typed::<(), ()>(&store)?;
-    // send.call(&mut store, ())?;
-    
-    // Allocate Memory Example
-    // let alloc = instance.get_func(&mut store, "allocate")
-    //     .expect("`alloc` was not an exported function");
-    // let alloc = alloc.typed::<i32, i32>(&store)?;
-    // let curr_ptr = alloc.call(&mut store, 128)?;
-    // println!("Allocated memory at: {:?}", curr_ptr);
-
-    // let add = instance.get_func(&mut store, "add")
-    //     .expect("`add` was not an exported function");
-    
-    // let add = add.typed::<(i32, i32), i32>(&store)?;
-    // let result = add.call(&mut store, (2, 2))?;
-    // println!("Answer: {:?}", result);
-
-    // let return_string = instance.get_func(&mut store, "return_string")
-    //     .expect("`return_string` was not an exported function");
-    // let return_string = return_string.typed::<(), ()>(&store)?;
-    // return_string.call(&mut store, ())?;
-
-
-    // Write to allocated memory memory and check working
-    // let say_hello = instance.get_func(&mut store, "say_hello")
-    //     .expect("`say_hello` was not an exported function");
-    // let say_hello = say_hello.typed::<(i32, i32), ()>(&store)?;
-    
-    // let first_name = b"Sarthak";
-    // let last_name = b"Khandelwal";
-    // memory.write(&mut store, curr_ptr.try_into().unwrap(), first_name)?;
-    // memory.write(&mut store, first_name.len(), last_name)?;
-    
-    // say_hello.call(&mut store, (curr_ptr, first_name.len() as i32))?;
-    // say_hello.call(&mut store, (first_name.len() as i32, last_name.len() as i32))?;
-
-    // let dealloc = instance.get_func(&mut store, "deallocate")
-    //     .expect("`deallocate` was not an exported function");
-    // let dealloc = dealloc.typed::<(i32, i32), ()>(&store)?;
-    // dealloc.call(&mut store, (curr_ptr, 128))?;
-    // println!("Deallocated memory at: {:?}", curr_ptr);
-
-    // say_hello.call(&mut store, (curr_ptr, first_name.len() as i32))?;
-
-    // let send_example_to_host = instance.get_func(&mut store, "send_example_to_host")
-    //     .expect("`send_example_to_host` was not an exported function");
-    // let send_example_to_host = send_example_to_host.typed::<(), ()>(&store)?;
-    // send_example_to_host.call(&mut store, ())?;
     Ok(())
 }
 
