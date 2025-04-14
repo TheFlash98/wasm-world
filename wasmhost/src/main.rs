@@ -4,11 +4,13 @@ use std::str;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use serde::{Serialize, Deserialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, BinaryHeap};
 use std::sync::mpsc::channel;
 use std::sync::mpsc::{Sender, Receiver};
 use rand::Rng;
 use std::time::{SystemTime, UNIX_EPOCH};
+use std::cmp::{Reverse, Ord, Ordering};
+
 
 
 #[derive(Serialize, Deserialize)]
@@ -18,7 +20,7 @@ pub struct Example {
     pub field3: [f32; 4],
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(tag="event_type")]
 pub enum EventData {
     AppendRequest {
@@ -37,7 +39,7 @@ pub enum EventData {
     },
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Event {
     pub fire_time: u128,
     pub data: EventData,
@@ -46,6 +48,26 @@ pub struct Event {
 impl Event {
     pub fn new(fire_time: u128, data: EventData) -> Self {
         Self { fire_time, data }
+    }
+}
+
+impl PartialEq for Event {
+    fn eq(&self, other: &Self) -> bool {
+        self.fire_time == other.fire_time
+    }
+}
+
+impl Eq for Event {}
+
+impl PartialOrd for Event {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Event {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.fire_time.cmp(&other.fire_time)
     }
 }
 
@@ -90,6 +112,8 @@ pub struct WasmInstance {
     instance: Instance,
     sender: Sender<Event>,
     receiver: Receiver<Event>,
+    // buffer: Arc<Mutex<BinaryHeap<Reverse<Event>>>>,
+    buffer: BinaryHeap<Reverse<Event>>,
 }
 
 #[derive(Clone)]
@@ -125,6 +149,8 @@ fn spawn_instance(store: &mut Store<HostContext>, linker: &Linker<HostContext>, 
         // memory,
         sender,
         receiver,
+        buffer: BinaryHeap::new(),
+        // buffer: Arc::new(Mutex::new(BinaryHeap::new()))
     };
     let instance_id = {
         let mut state = context.state.lock().unwrap();
@@ -147,65 +173,51 @@ fn handle_send_recv(mut store: Store<HostContext>) {
     let mut state = context.state.lock().unwrap();
     loop {
         for (id, wasm_instance) in state.instances.iter_mut() {
-            let receiver = &wasm_instance.receiver;
-            let mut recv_iter = receiver.try_iter().peekable();
-            // println!("Checking events for instance {}", id);
-            std::thread::sleep(std::time::Duration::from_millis(1));
-            if recv_iter.peek().is_none() {
-                // println!("No events to process for instance {}", id);
-                continue;
-            } else {
-                while let Some(next_event) = recv_iter.peek() {
-                    let now = get_epoch_ms();
-                    println!("{}", next_event.fire_time > now);
-                    if next_event.fire_time > now {
-                        println!(
-                            "Event for a later time due {}: {:?} > {:}",
-                            id, next_event.fire_time, now
-                        );
-                        break; // Exit the inner loop but keep the event in the iterator
-                    } else {
-                        // Consume the event
-                        let next_event = recv_iter.next().unwrap();
-                        println!("Processing event for instance {}: {:?}", id, next_event);
 
-                        // Process the event here
-                        match next_event.data {
-                            EventData::RawMessage { message } => {
-                                println!("Received message for instance {}: {:?}", id, message);
-                                // Add your message handling logic here
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            let now = get_epoch_ms();
+            let receiver = &wasm_instance.receiver;
+            // let mut buffer = wasm_instance.buffer.lock().unwrap();
+            let mut buffer = &mut wasm_instance.buffer;
+            if id == &1 {
+                // println!("Buffer for instance {}: {:?}", id, buffer.len());
+            }
+            // println!("Checking events for instance {} {}", id, buffer.len());
+            while let Some(buffer_head) = buffer.peek() {
+                if buffer_head.0.fire_time > now {
+                    // println!("Buffer head is in the future: {:?}", buffer_head);
+                    break;
+                } else {
+                    println!("Buffer head is in the past at {}", now);
+                    println!("Processing event from buffer for instance {}: {:?} at time {}", id, buffer_head, buffer_head.0.fire_time);
+                    let event = buffer.pop().unwrap().0;
+                    match event.data {
+                        EventData::RawMessage { message } => {
+                            println!("Received message for instance {}: {:?}", id, message);
+                            // let mut state = context.state.lock().unwrap();
+                            let instance = wasm_instance.instance;
+                            if let Some(receive_func) = instance.get_func(&mut store, "receive") {
+                                let receive_func = receive_func.typed::<(i32, i32), ()>(&store).unwrap();
+                                let alloc_func = instance.get_func(&mut store, "allocate").unwrap().typed::<i32, i32>(&store).unwrap();
+                                
+                                let msg_ptr = alloc_func.call(&mut store, message.len() as i32).unwrap();
+                                let memory = instance.get_memory(&mut store, "memory").unwrap();
+                                memory.write(&mut store, msg_ptr as usize, message.as_bytes()).unwrap();
+                                
+                                receive_func.call(&mut store, (msg_ptr, message.len() as i32)).unwrap();
                             }
-                            _ => {
-                                println!("Unhandled event for instance {}: {:?}", id, next_event);
-                            }
+                        },
+                        _ => {
+                            println!("Received event for instance {}: {:?}", id, event);
                         }
                     }
-                    std::thread::sleep(std::time::Duration::from_millis(1));
                 }
             }
-            println!("Done checking events for instance {}", id);
-            // for event in receiver.try_iter().peekable() {
-            //     match event.data {
-            //         EventData::RawMessage { message } => {
-            //             println!("Received message for instance {}: {:?}", id, message);
-            //             // let mut state = context.state.lock().unwrap();
-            //             let instance = wasm_instance.instance;
-            //             if let Some(receive_func) = instance.get_func(&mut store, "receive") {
-            //                 let receive_func = receive_func.typed::<(i32, i32), ()>(&store).unwrap();
-            //                 let alloc_func = instance.get_func(&mut store, "allocate").unwrap().typed::<i32, i32>(&store).unwrap();
-                            
-            //                 let msg_ptr = alloc_func.call(&mut store, message.len() as i32).unwrap();
-            //                 let memory = instance.get_memory(&mut store, "memory").unwrap();
-            //                 memory.write(&mut store, msg_ptr as usize, message.as_bytes()).unwrap();
-                            
-            //                 receive_func.call(&mut store, (msg_ptr, message.len() as i32)).unwrap();
-            //             }
-            //         },
-            //         _ => {
-            //             println!("Received event for instance {}: {:?}", id, event);
-            //         }
-            //     }
-            // }
+            let mut recv_iter = receiver.try_iter();
+            while let Some(next_event) = recv_iter.next() {
+                println!("Received event for instance {}: {:?}", id, next_event);
+                buffer.push(Reverse(next_event));
+            }
         }
     }
 }
@@ -281,13 +293,13 @@ fn log_struct(mut caller: Caller<'_, HostContext>, ptr: i32, len: i32) {
 }
 
 fn get_epoch_ms() -> u128 {
-    println!("Getting epoch ms");
+    // println!("Getting epoch ms");
     // Get the current time in milliseconds since the UNIX epoch
     let time = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_millis();
-    println!("Current time in milliseconds: {:?}", time);
+    // println!("Current time in milliseconds: {:?}", time);
     time
 }
 
