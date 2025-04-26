@@ -12,25 +12,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use std::cmp::{Reverse, Ord, Ordering};
 
 
-
-#[derive(Serialize, Deserialize)]
-pub struct Example {
-    pub field1: HashMap<u32, String>,
-    pub field2: Vec<Vec<f32>>,
-    pub field3: [f32; 4],
-}
-
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(tag="event_type")]
 pub enum EventData {
-    AppendRequest {
-        param1: i32,
-        param2: i32,
-        param3: i32,
-    },
-    AppendRequestResponse {
-        param4: i32
-    },
     Timer {
         timer_name: String  
     },
@@ -42,12 +26,13 @@ pub enum EventData {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Event {
     pub fire_time: u128,
+    pub sender_id: i32,
     pub data: EventData,
 }
 
 impl Event {
-    pub fn new(fire_time: u128, data: EventData) -> Self {
-        Self { fire_time, data }
+    pub fn new(fire_time: u128, sender_id: i32, data: EventData) -> Self {
+        Self { fire_time, sender_id, data }
     }
 }
 
@@ -137,7 +122,6 @@ impl Default for HostContext {
     }
 }
 
-
 fn spawn_instance(store: &mut Store<HostContext>, linker: &Linker<HostContext>, module: &Module) -> Result<(), Box<dyn Error>> {
     let context = store.data().clone();
     let instance = linker.instantiate(&mut *store, module)?;
@@ -168,19 +152,19 @@ fn spawn_instance(store: &mut Store<HostContext>, linker: &Linker<HostContext>, 
     Ok(())
 }
 
-fn handle_send_recv(mut store: Store<HostContext>) {
+fn _handle_send_recv_old(mut store: Store<HostContext>) {
     let context = store.data().clone();
-    let mut state = context.state.lock().unwrap();
-    loop {
+    loop {{
+        let mut state = context.state.lock().unwrap();
         for (id, wasm_instance) in state.instances.iter_mut() {
-
+            println!("Checking events for instance {}", id);
             std::thread::sleep(std::time::Duration::from_millis(1));
             let now = get_epoch_ms();
             let receiver = &wasm_instance.receiver;
             // let mut buffer = wasm_instance.buffer.lock().unwrap();
             let mut buffer = &mut wasm_instance.buffer;
-            if id == &1 {
-                // println!("Buffer for instance {}: {:?}", id, buffer.len());
+            if id == &2 {
+                println!("Buffer for instance {}: {:?}", id, buffer.len());
             }
             // println!("Checking events for instance {} {}", id, buffer.len());
             while let Some(buffer_head) = buffer.peek() {
@@ -197,14 +181,14 @@ fn handle_send_recv(mut store: Store<HostContext>) {
                             // let mut state = context.state.lock().unwrap();
                             let instance = wasm_instance.instance;
                             if let Some(receive_func) = instance.get_func(&mut store, "receive") {
-                                let receive_func = receive_func.typed::<(i32, i32), ()>(&store).unwrap();
+                                let receive_func = receive_func.typed::<(i32, i32, i32), ()>(&store).unwrap();
                                 let alloc_func = instance.get_func(&mut store, "allocate").unwrap().typed::<i32, i32>(&store).unwrap();
                                 
                                 let msg_ptr = alloc_func.call(&mut store, message.len() as i32).unwrap();
                                 let memory = instance.get_memory(&mut store, "memory").unwrap();
                                 memory.write(&mut store, msg_ptr as usize, message.as_bytes()).unwrap();
                                 
-                                receive_func.call(&mut store, (msg_ptr, message.len() as i32)).unwrap();
+                                receive_func.call(&mut store, (event.sender_id, msg_ptr, message.len() as i32)).unwrap();
                             }
                         },
                         _ => {
@@ -218,7 +202,67 @@ fn handle_send_recv(mut store: Store<HostContext>) {
                 println!("Received event for instance {}: {:?}", id, next_event);
                 buffer.push(Reverse(next_event));
             }
+            println!("Done checking events for instance {}", id);
         }
+    }
+    std::thread::sleep(std::time::Duration::from_millis(10));
+}
+}
+
+fn handle_send_recv(mut store: Store<HostContext>) {
+    let context = store.data().clone();
+    loop {
+        let events_to_process: Vec<(i32, Event, Instance)> = {
+            let mut state = context.state.lock().unwrap();
+            let mut events = Vec::new();
+            
+            for (id, wasm_instance) in state.instances.iter_mut() {
+                let now = get_epoch_ms();
+                
+                // Process events from buffer that are ready
+                while let Some(buffer_head) = wasm_instance.buffer.peek() {
+                    if buffer_head.0.fire_time > now {
+                        break;
+                    } else {
+                        let event = wasm_instance.buffer.pop().unwrap().0;
+                        events.push((*id, event, wasm_instance.instance));
+                    }
+                }
+                
+                // Add new events from receiver to buffer
+                let mut recv_iter = wasm_instance.receiver.try_iter();
+                while let Some(next_event) = recv_iter.next() {
+                    wasm_instance.buffer.push(Reverse(next_event));
+                }
+            }
+            
+            events
+        }; // Release the lock on state here
+        
+        // Now process all events without holding the lock
+        for (id, event, instance) in events_to_process {
+            match event.data {
+                EventData::RawMessage { message } => {
+                    println!("Processing message for instance {}: {:?}", id, message);
+                    
+                    if let Some(receive_func) = instance.get_func(&mut store, "receive") {
+                        let receive_func = receive_func.typed::<(i32, i32, i32), ()>(&store).unwrap();
+                        let alloc_func = instance.get_func(&mut store, "allocate").unwrap().typed::<i32, i32>(&store).unwrap();
+                        
+                        let msg_ptr = alloc_func.call(&mut store, message.len() as i32).unwrap();
+                        let memory = instance.get_memory(&mut store, "memory").unwrap();
+                        memory.write(&mut store, msg_ptr as usize, message.as_bytes()).unwrap();
+                        
+                        receive_func.call(&mut store, (event.sender_id, msg_ptr, message.len() as i32)).unwrap();
+                    }
+                },
+                _ => {
+                    println!("Processed event for instance {}: {:?}", id, event);
+                }
+            }
+        }
+        
+        std::thread::sleep(std::time::Duration::from_millis(10));
     }
 }
 
@@ -231,16 +275,43 @@ fn main() -> Result<(), Box<dyn Error>> {
     linker.func_wrap("env", "log_str", |caller: Caller<'_, HostContext>, ptr, len| {
         log_str(caller, ptr, len)
     })?;
-    linker.func_wrap("env", "double", double)?;
-    linker.func_wrap("env", "log_struct", log_struct)?;
     linker.func_wrap("env", "send_message", send_message)?;
 
     // let wasm_instance = spawn_instance(&mut store, &linker, &module)?;
-    for _ in 1..=3 {
+    for _ in 1..=4 {
         spawn_instance(&mut store, &linker, &module)?;
     }
+
+    // Make instance #1 leader, ideally can be chosen at random in the future
+    // as long as we can remember who it is
+    let leader_instance ={
+        let mut state = context.state.lock().unwrap();
+        state.instances.get_mut(&1).unwrap().instance
+    };
+    let make_leader_host = leader_instance.get_func(&mut store, "make_leader_host")
+        .expect("make_leader_host function not found");
+    let make_leader_host = make_leader_host.typed::<(), ()>(&mut store)
+        .expect("make_leader_host function call failed");
+    make_leader_host.call(&mut store, ())?;
+
+    // Make the last instance spawned as the client who
+    // issues enqueue, dequeue requests
+    let client_id = {
+        let mut state = context.state.lock().unwrap();
+        state.counter as i32
+    };
+    println!("Client ID: {:?}", client_id);
+    let client = {
+        let mut state = context.state.lock().unwrap();
+        state.instances.get_mut(&client_id).unwrap().instance
+    };
+    let client_enqueue = client.get_func(&mut store, "client_enqueue")
+        .expect("client_enqueue function not found");
+    let client_enqueue = client_enqueue.typed::<(i32, i32, i32), ()>(&mut store)
+        .expect("client_enqueue function call failed");
+    client_enqueue.call(&mut store, (111, 1, client_id))?;
+
     thread::spawn({
-        let context = context.clone();
         move || {
             handle_send_recv(store);
         }
@@ -249,9 +320,6 @@ fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn double(x: i32) -> i32 {
-    x * 2
-}
 
 fn log_str(mut caller: Caller<'_, HostContext>, ptr: i32, len: i32) {
     let mem = match caller.get_export("memory") {
@@ -268,28 +336,7 @@ fn log_str(mut caller: Caller<'_, HostContext>, ptr: i32, len: i32) {
         Some(data) => str::from_utf8(data).unwrap_or("invalid utf-8"),
         None => "pointer/length out of bounds",
     };
-    println!("From wasm: {}", string);
-}
-
-fn log_struct(mut caller: Caller<'_, HostContext>, ptr: i32, len: i32) {
-    let mem = match caller.get_export("memory") {
-        Some(Extern::Memory(mem)) => mem,
-        _ => {
-            println!("failed to find `memory` export");
-            return;
-        },
-    };
-    let data = mem.data(&caller)
-        .get(ptr as u32 as usize..)
-        .and_then(|arr| arr.get(..len as u32 as usize));
-    let serialized = match data {
-        Some(data) => str::from_utf8(data).unwrap_or("invalid utf-8"),
-        None => "pointer/length out of bounds",
-    };
-    let deserialized: Example = ron::from_str(serialized).unwrap();
-    println!("deserialized = {:?}", deserialized.field1);
-    println!("deserialized = {:?}", deserialized.field2);
-    println!("deserialized = {:?}", deserialized.field3);
+    println!("--> From wasm: {}", string);
 }
 
 fn get_epoch_ms() -> u128 {
@@ -326,29 +373,21 @@ pub fn send_message(mut caller: Caller<'_, HostContext>, target_id: i32, msg_ptr
         .and_then(|arr| arr.get(..msg_len as usize))
         .map(|s| String::from_utf8_lossy(s).to_string());
     if let Some(message) = message {
+        
         let context = caller.data().clone();
         // let state = context.state.clone();
         let mut state = context.state.lock().unwrap();
+        println!("Message to send: {:?}", message);
         let delay = {
             let devil_cat = &state.devil_cat; // Immutable borrow
             devil_cat.get_random_delay()
         };
+        
         if let Some(wasm_instance) = state.instances.get_mut(&target_id) {
             let sender = &wasm_instance.sender;
-            let event = Event::new(get_epoch_ms() + delay, EventData::RawMessage { message: message.clone() });
+            let event = Event::new(get_epoch_ms() + delay, instance_id, EventData::RawMessage { message: message.clone() });
             println!("Message sent to instance {}: {:?}", target_id, event);
             sender.send(event).unwrap();
-            // let instance = wasm_instance.instance;
-            // if let Some(receive_func) = instance.get_func(&mut caller, "receive") {
-            //     let receive_func = receive_func.typed::<(i32, i32), ()>(&caller).unwrap();
-            //     let alloc_func = instance.get_func(&mut caller, "allocate").unwrap().typed::<i32, i32>(&caller).unwrap();
-                
-            //     let msg_ptr = alloc_func.call(&mut caller, message.len() as i32).unwrap();
-            //     let memory = instance.get_memory(&mut caller, "memory").unwrap();
-            //     memory.write(&mut caller, msg_ptr as usize, message.as_bytes()).unwrap();
-
-            //     receive_func.call(&mut caller, (msg_ptr, message.len() as i32)).unwrap();
-            // }
         }
     }
 }
