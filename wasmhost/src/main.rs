@@ -1,22 +1,42 @@
-use std::error::Error;
+use anyhow::{anyhow, Context, Result};
 use wasmtime::*;
 use std::str;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use serde::{Serialize, Deserialize};
 use std::collections::{HashMap, BinaryHeap};
+use std::io::BufRead;
 use std::sync::mpsc::channel;
 use std::sync::mpsc::{Sender, Receiver};
 use rand::Rng;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use std::cmp::{Reverse, Ord, Ordering};
+
+const WASM_PATH: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../wasminstance/target/wasm32-unknown-unknown/release/wasminstance.wasm"
+);
+const DEFAULT_SERVERS: i32 = 3;
+const LOG_DEBUG: i32 = 1;
+
+const HELP: &str = "\
+commands:
+  enq <n>             the client enqueues n
+  deq                 the client dequeues
+  kill <id|leader>    crash a server; messages to it are lost
+  revive <id|all>     restart crashed servers (they keep their term, vote and log)
+  status              show every node's Raft state
+  verbose on|off      also show every message, heartbeat and debug line
+  delay <min> <max>   set the network delay range in ms
+  sleep <ms>          wait before reading the next command (for scripts)
+  help, quit";
 
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(tag="event_type")]
 pub enum EventData {
     Timer {
-        timer_name: String  
+        token: i32
     },
     RawMessage {
         message: String
@@ -74,11 +94,52 @@ impl DevilCat {
     }
 }
 
+/// Checks two of Raft's guarantees as nodes report them: at most one leader
+/// per term (Election Safety), and every node applying the same entry at a
+/// given log index (State Machine Safety).
+#[derive(Default)]
+pub struct SafetyChecker {
+    leaders: HashMap<i32, i32>, // term -> leader
+    applied: HashMap<i32, i32>, // log index -> term of the entry applied there
+    violations: u32,
+}
+
+impl SafetyChecker {
+    fn record_leader(&mut self, term: i32, node: i32) -> Option<String> {
+        let first = *self.leaders.entry(term).or_insert(node);
+        (first != node).then(|| {
+            self.violations += 1;
+            format!("two leaders in term {}: nodes {} and {}", term, first, node)
+        })
+    }
+
+    fn record_applied(&mut self, index: i32, term: i32, node: i32) -> Option<String> {
+        let first = *self.applied.entry(index).or_insert(term);
+        (first != term).then(|| {
+            self.violations += 1;
+            format!("node {} applied an entry from term {} at index {}, others applied term {}", node, term, index, first)
+        })
+    }
+
+    fn summary(&self) -> String {
+        format!(
+            "safety: {} terms had a leader, {} log entries applied, {} violations",
+            self.leaders.len(),
+            self.applied.len(),
+            self.violations,
+        )
+    }
+}
+
 pub struct WasmHostState {
     pub instances: HashMap<i32, WasmInstance>,
     pub counter: u32,
     pub config: HashMap<String, String>,
     pub devil_cat: DevilCat,
+    pub num_servers: i32,
+    pub verbose: bool,
+    pub started: Instant,
+    pub safety: SafetyChecker,
 }
 
 impl Default for WasmHostState {
@@ -87,8 +148,31 @@ impl Default for WasmHostState {
             instances: HashMap::new(),
             counter: 0,
             config: HashMap::new(),
-            devil_cat: DevilCat::new(10, 5000),
+            // Raft needs message delays well under its 1.5-3 s election timeout.
+            devil_cat: DevilCat::new(10, 150),
+            num_servers: DEFAULT_SERVERS,
+            verbose: false,
+            started: Instant::now(),
+            safety: SafetyChecker::default(),
         }
+    }
+}
+
+impl WasmHostState {
+    fn label(&self, id: i32) -> String {
+        if id == self.num_servers + 1 { "client".to_string() } else { format!("node {}", id) }
+    }
+
+    fn print(&self, who: &str, message: &str) {
+        println!("[{:>8.3}s] {:<7}| {}", self.started.elapsed().as_secs_f64(), who, message);
+    }
+
+    fn is_server(&self, id: i32) -> bool {
+        (1..=self.num_servers).contains(&id)
+    }
+
+    fn is_alive(&self, id: i32) -> bool {
+        self.instances.get(&id).is_some_and(|instance| instance.alive)
     }
 }
 
@@ -97,8 +181,17 @@ pub struct WasmInstance {
     instance: Instance,
     sender: Sender<Event>,
     receiver: Receiver<Event>,
-    // buffer: Arc<Mutex<BinaryHeap<Reverse<Event>>>>,
     buffer: BinaryHeap<Reverse<Event>>,
+    alive: bool,
+}
+
+impl WasmInstance {
+    /// Drops everything in flight to this node, like a crashed machine would.
+    fn shut_down(&mut self) {
+        self.alive = false;
+        self.buffer.clear();
+        self.receiver.try_iter().for_each(drop);
+    }
 }
 
 #[derive(Clone)]
@@ -114,6 +207,10 @@ impl HostContext {
             engine: Arc::new(Engine::default()),
         }
     }
+
+    fn print(&self, who: &str, message: &str) {
+        self.state.lock().unwrap().print(who, message);
+    }
 }
 
 impl Default for HostContext {
@@ -122,272 +219,422 @@ impl Default for HostContext {
     }
 }
 
-fn spawn_instance(store: &mut Store<HostContext>, linker: &Linker<HostContext>, module: &Module) -> Result<(), Box<dyn Error>> {
+enum Command {
+    Enqueue(i32),
+    Dequeue,
+    // None kills whichever server is leading right now.
+    Kill(Option<i32>),
+    // None revives every server that is down.
+    Revive(Option<i32>),
+    Status,
+    Verbose(bool),
+    Delay(i32, i32),
+    Help,
+    Quit,
+}
+
+fn spawn_instance(store: &mut Store<HostContext>, linker: &Linker<HostContext>, module: &Module) -> Result<()> {
     let context = store.data().clone();
     let instance = linker.instantiate(&mut *store, module)?;
-    // let memory = instance.get_memory(&mut *store, "memory")
-    //     .expect("memory export not found");
     let (sender, receiver) = channel();
     let wasm_instance = WasmInstance {
         instance,
-        // memory,
         sender,
         receiver,
         buffer: BinaryHeap::new(),
-        // buffer: Arc::new(Mutex::new(BinaryHeap::new()))
+        alive: true,
     };
-    let instance_id = {
+    let (instance_id, num_servers) = {
         let mut state = context.state.lock().unwrap();
         state.counter += 1;
         let instance_id = state.counter as i32;
         state.instances.insert(instance_id, wasm_instance);
-        instance_id
+        (instance_id, state.num_servers)
     };
-    let start = instance.get_func(&mut *store, "start")
-        .expect("start function not found");
-    let start = start.typed::<i32, ()>(&mut *store)
-        .expect("start function not found");
-    start.call(&mut *store, instance_id)?;
-    
-    Ok(())
+    call_export::<(i32, i32), ()>(store, instance, "start", (instance_id, num_servers))
 }
 
-fn _handle_send_recv_old(mut store: Store<HostContext>) {
+fn call_export<Params: WasmParams, Results: WasmResults>(
+    store: &mut Store<HostContext>,
+    instance: Instance,
+    name: &str,
+    params: Params,
+) -> Result<Results> {
+    instance.get_typed_func::<Params, Results>(&mut *store, name)?.call(&mut *store, params)
+}
+
+/// Calls an export on a live node. A trap (say, a panic in the guest) counts
+/// as that node crashing.
+fn call_node<Params: WasmParams, Results: WasmResults>(
+    store: &mut Store<HostContext>,
+    id: i32,
+    name: &str,
+    params: Params,
+) -> Option<Results> {
     let context = store.data().clone();
-    loop {{
-        let mut state = context.state.lock().unwrap();
-        for (id, wasm_instance) in state.instances.iter_mut() {
-            println!("Checking events for instance {}", id);
-            std::thread::sleep(std::time::Duration::from_millis(1));
-            let now = get_epoch_ms();
-            let receiver = &wasm_instance.receiver;
-            // let mut buffer = wasm_instance.buffer.lock().unwrap();
-            let mut buffer = &mut wasm_instance.buffer;
-            if id == &2 {
-                println!("Buffer for instance {}: {:?}", id, buffer.len());
-            }
-            // println!("Checking events for instance {} {}", id, buffer.len());
-            while let Some(buffer_head) = buffer.peek() {
-                if buffer_head.0.fire_time > now {
-                    // println!("Buffer head is in the future: {:?}", buffer_head);
-                    break;
-                } else {
-                    println!("Buffer head is in the past at {}", now);
-                    println!("Processing event from buffer for instance {}: {:?} at time {}", id, buffer_head, buffer_head.0.fire_time);
-                    let event = buffer.pop().unwrap().0;
-                    match event.data {
-                        EventData::RawMessage { message } => {
-                            println!("Received message for instance {}: {:?}", id, message);
-                            // let mut state = context.state.lock().unwrap();
-                            let instance = wasm_instance.instance;
-                            if let Some(receive_func) = instance.get_func(&mut store, "receive") {
-                                let receive_func = receive_func.typed::<(i32, i32, i32), ()>(&store).unwrap();
-                                let alloc_func = instance.get_func(&mut store, "allocate").unwrap().typed::<i32, i32>(&store).unwrap();
-                                
-                                let msg_ptr = alloc_func.call(&mut store, message.len() as i32).unwrap();
-                                let memory = instance.get_memory(&mut store, "memory").unwrap();
-                                memory.write(&mut store, msg_ptr as usize, message.as_bytes()).unwrap();
-                                
-                                receive_func.call(&mut store, (event.sender_id, msg_ptr, message.len() as i32)).unwrap();
-                            }
-                        },
-                        _ => {
-                            println!("Received event for instance {}: {:?}", id, event);
-                        }
-                    }
-                }
-            }
-            let mut recv_iter = receiver.try_iter();
-            while let Some(next_event) = recv_iter.next() {
-                println!("Received event for instance {}: {:?}", id, next_event);
-                buffer.push(Reverse(next_event));
-            }
-            println!("Done checking events for instance {}", id);
+    let instance = {
+        let state = context.state.lock().unwrap();
+        match state.instances.get(&id) {
+            Some(wasm_instance) if wasm_instance.alive => wasm_instance.instance,
+            _ => return None,
+        }
+    };
+    match call_export(store, instance, name, params) {
+        Ok(results) => Some(results),
+        Err(error) => {
+            crash(&context, id, &error);
+            None
         }
     }
-    std::thread::sleep(std::time::Duration::from_millis(10));
-}
 }
 
-fn handle_send_recv(mut store: Store<HostContext>) {
+fn crash(context: &HostContext, id: i32, error: &anyhow::Error) {
+    let mut state = context.state.lock().unwrap();
+    if let Some(wasm_instance) = state.instances.get_mut(&id) {
+        wasm_instance.shut_down();
+    }
+    let label = state.label(id);
+    state.print("host", &format!("{} crashed and is now down: {:#}", label, error));
+}
+
+fn deliver_message(store: &mut Store<HostContext>, instance: Instance, sender_id: i32, message: &str) -> Result<()> {
+    let len = message.len() as i32;
+    let msg_ptr: i32 = call_export(store, instance, "allocate", len)?;
+    let memory = instance.get_memory(&mut *store, "memory")
+        .ok_or_else(|| anyhow!("memory export not found"))?;
+    memory.write(&mut *store, msg_ptr as usize, message.as_bytes())?;
+    call_export::<(i32, i32, i32), ()>(store, instance, "receive", (sender_id, msg_ptr, len))?;
+    call_export::<(i32, i32), ()>(store, instance, "deallocate", (msg_ptr, len))
+}
+
+fn run_simulation(store: &mut Store<HostContext>, commands: Receiver<(String, Command)>) {
     let context = store.data().clone();
     loop {
-        let events_to_process: Vec<(i32, Event, Instance)> = {
-            let mut state = context.state.lock().unwrap();
-            let mut events = Vec::new();
-            
-            for (id, wasm_instance) in state.instances.iter_mut() {
-                let now = get_epoch_ms();
-                
-                // Process events from buffer that are ready
-                while let Some(buffer_head) = wasm_instance.buffer.peek() {
-                    if buffer_head.0.fire_time > now {
-                        break;
-                    } else {
-                        let event = wasm_instance.buffer.pop().unwrap().0;
-                        events.push((*id, event, wasm_instance.instance));
-                    }
-                }
-                
-                // Add new events from receiver to buffer
-                let mut recv_iter = wasm_instance.receiver.try_iter();
-                while let Some(next_event) = recv_iter.next() {
-                    wasm_instance.buffer.push(Reverse(next_event));
-                }
-            }
-            
-            events
-        }; // Release the lock on state here
-        
-        // Now process all events without holding the lock
-        for (id, event, instance) in events_to_process {
-            match event.data {
-                EventData::RawMessage { message } => {
-                    println!("Processing message for instance {}: {:?}", id, message);
-                    
-                    if let Some(receive_func) = instance.get_func(&mut store, "receive") {
-                        let receive_func = receive_func.typed::<(i32, i32, i32), ()>(&store).unwrap();
-                        let alloc_func = instance.get_func(&mut store, "allocate").unwrap().typed::<i32, i32>(&store).unwrap();
-                        
-                        let msg_ptr = alloc_func.call(&mut store, message.len() as i32).unwrap();
-                        let memory = instance.get_memory(&mut store, "memory").unwrap();
-                        memory.write(&mut store, msg_ptr as usize, message.as_bytes()).unwrap();
-                        
-                        receive_func.call(&mut store, (event.sender_id, msg_ptr, message.len() as i32)).unwrap();
-                    }
-                },
-                _ => {
-                    println!("Processed event for instance {}: {:?}", id, event);
-                }
+        while let Ok((line, command)) = commands.try_recv() {
+            context.print("host", &format!("> {}", line));
+            if !handle_command(store, command) {
+                return;
             }
         }
-        
-        std::thread::sleep(std::time::Duration::from_millis(10));
+
+        let mut events_to_process: Vec<(i32, Event, Instance)> = {
+            let mut state = context.state.lock().unwrap();
+            let now = get_epoch_ms();
+            let mut events = Vec::new();
+
+            for (id, wasm_instance) in state.instances.iter_mut() {
+                // Add new events from receiver to buffer
+                wasm_instance.buffer.extend(wasm_instance.receiver.try_iter().map(Reverse));
+
+                // Take the events from the buffer that are ready
+                while wasm_instance.buffer.peek().is_some_and(|head| head.0.fire_time <= now) {
+                    let event = wasm_instance.buffer.pop().unwrap().0;
+                    events.push((*id, event, wasm_instance.instance));
+                }
+            }
+
+            events
+        }; // Release the lock: the guest calls back into the host, which locks it again.
+        events_to_process.sort_by_key(|(_, event, _)| event.fire_time);
+
+        for (id, event, instance) in events_to_process {
+            // A node can crash while handling an earlier event in this batch.
+            if !context.state.lock().unwrap().is_alive(id) {
+                continue;
+            }
+            let result = match event.data {
+                EventData::RawMessage { message } => deliver_message(store, instance, event.sender_id, &message),
+                EventData::Timer { token } => call_export::<i32, ()>(store, instance, "on_timer", token),
+            };
+            if let Err(error) = result {
+                crash(&context, id, &error);
+            }
+        }
+
+        thread::sleep(Duration::from_millis(5));
     }
 }
 
-fn main() -> Result<(), Box<dyn Error>> {
-    
+/// Returns false when the simulation should stop.
+fn handle_command(store: &mut Store<HostContext>, command: Command) -> bool {
+    let context = store.data().clone();
+    let client_id = context.state.lock().unwrap().num_servers + 1;
+    match command {
+        Command::Enqueue(value) => {
+            call_node::<i32, ()>(store, client_id, "client_enqueue", value);
+        }
+        Command::Dequeue => {
+            call_node::<(), ()>(store, client_id, "client_dequeue", ());
+        }
+        Command::Kill(target) => kill(store, target),
+        Command::Revive(target) => revive(store, target),
+        Command::Status => status(store),
+        Command::Verbose(on) => context.state.lock().unwrap().verbose = on,
+        Command::Delay(min_delay, max_delay) => {
+            if min_delay < 0 || min_delay > max_delay {
+                context.print("host", "delay needs 0 <= min <= max");
+            } else {
+                context.state.lock().unwrap().devil_cat = DevilCat::new(min_delay, max_delay);
+            }
+        }
+        Command::Help => println!("{}", HELP),
+        Command::Quit => return false,
+    }
+    true
+}
+
+/// The live server with the highest term that thinks it is leader.
+fn find_leader(store: &mut Store<HostContext>) -> Option<i32> {
+    let num_servers = store.data().state.lock().unwrap().num_servers;
+    (1..=num_servers)
+        .filter_map(|id| call_node::<(), i32>(store, id, "leader_term", ()).map(|term| (term, id)))
+        .filter(|&(term, _)| term >= 0)
+        .max()
+        .map(|(_, id)| id)
+}
+
+fn kill(store: &mut Store<HostContext>, target: Option<i32>) {
+    let context = store.data().clone();
+    let Some(id) = target.or_else(|| find_leader(store)) else {
+        context.print("host", "no live leader to kill right now");
+        return;
+    };
+    let mut state = context.state.lock().unwrap();
+    if !state.is_server(id) {
+        state.print("host", &format!("{} is not a server", state.label(id)));
+        return;
+    }
+    if !state.is_alive(id) {
+        state.print("host", &format!("node {} is already down", id));
+        return;
+    }
+    state.instances.get_mut(&id).unwrap().shut_down();
+    state.print("host", &format!("node {} killed", id));
+}
+
+fn revive(store: &mut Store<HostContext>, target: Option<i32>) {
+    let context = store.data().clone();
+    let ids: Vec<i32> = {
+        let state = context.state.lock().unwrap();
+        match target {
+            Some(id) => vec![id],
+            None => (1..=state.num_servers).filter(|&id| !state.is_alive(id)).collect(),
+        }
+    };
+    if ids.is_empty() {
+        context.print("host", "every server is already running");
+    }
+    for id in ids {
+        {
+            let mut state = context.state.lock().unwrap();
+            if !state.is_server(id) {
+                state.print("host", &format!("{} is not a server", state.label(id)));
+                continue;
+            }
+            if state.is_alive(id) {
+                state.print("host", &format!("node {} is already running", id));
+                continue;
+            }
+            state.instances.get_mut(&id).unwrap().alive = true;
+            state.print("host", &format!("node {} revived", id));
+        }
+        call_node::<(), ()>(store, id, "restart", ());
+    }
+}
+
+fn status(store: &mut Store<HostContext>) {
+    let context = store.data().clone();
+    let num_servers = context.state.lock().unwrap().num_servers;
+    for id in 1..=num_servers + 1 {
+        if call_node::<(), ()>(store, id, "status", ()).is_none() {
+            let state = context.state.lock().unwrap();
+            state.print(&state.label(id), "DOWN");
+        }
+    }
+    let state = context.state.lock().unwrap();
+    let network = format!("network delay {}-{} ms", state.devil_cat.min_delay, state.devil_cat.max_delay);
+    state.print("host", &format!("{}; {}", network, state.safety.summary()));
+}
+
+fn parse_number(word: &str) -> Result<i32, String> {
+    word.parse().map_err(|_| format!("`{}` is not a number", word))
+}
+
+fn parse_command(line: &str) -> Result<Command, String> {
+    let words: Vec<&str> = line.split_whitespace().collect();
+    match words.as_slice() {
+        ["enq" | "enqueue", value] => Ok(Command::Enqueue(parse_number(value)?)),
+        ["deq" | "dequeue"] => Ok(Command::Dequeue),
+        ["kill", "leader"] => Ok(Command::Kill(None)),
+        ["kill", id] => Ok(Command::Kill(Some(parse_number(id)?))),
+        ["revive", "all"] => Ok(Command::Revive(None)),
+        ["revive", id] => Ok(Command::Revive(Some(parse_number(id)?))),
+        ["status"] => Ok(Command::Status),
+        ["verbose", "on"] => Ok(Command::Verbose(true)),
+        ["verbose", "off"] => Ok(Command::Verbose(false)),
+        ["delay", min_delay, max_delay] => Ok(Command::Delay(parse_number(min_delay)?, parse_number(max_delay)?)),
+        ["help"] => Ok(Command::Help),
+        ["quit" | "exit"] => Ok(Command::Quit),
+        _ => Err(format!("unknown command `{}`, try `help`", line)),
+    }
+}
+
+/// Reads commands from stdin, typed or piped in from a script.
+fn spawn_command_reader() -> Receiver<(String, Command)> {
+    let (sender, receiver) = channel();
+    thread::spawn(move || {
+        for line in std::io::stdin().lock().lines() {
+            let Ok(line) = line else { break };
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            // Handled here so it pauses the script, not the simulation.
+            if let Some(ms) = line.strip_prefix("sleep ") {
+                match ms.trim().parse() {
+                    Ok(ms) => thread::sleep(Duration::from_millis(ms)),
+                    Err(_) => println!("usage: sleep <ms>"),
+                }
+                continue;
+            }
+            match parse_command(line) {
+                Ok(command) => {
+                    if sender.send((line.to_string(), command)).is_err() {
+                        return;
+                    }
+                }
+                Err(message) => println!("{}", message),
+            }
+        }
+        // End of input (Ctrl-D, or the end of a script) stops the simulation.
+        let _ = sender.send(("quit".to_string(), Command::Quit));
+    });
+    receiver
+}
+
+fn main() -> Result<()> {
+    let num_servers: i32 = match std::env::args().nth(1) {
+        Some(arg) => arg.parse().ok().filter(|&n| n >= 1)
+            .ok_or_else(|| anyhow!("usage: wasmhost [number of servers, default {}]", DEFAULT_SERVERS))?,
+        None => DEFAULT_SERVERS,
+    };
+
     let context = HostContext::new();
-    let module = Module::from_file(&context.engine, "../wasminstance/target/wasm32-unknown-unknown/release/wasminstance.wasm")?;
+    context.state.lock().unwrap().num_servers = num_servers;
+    let module = Module::from_file(&context.engine, WASM_PATH)
+        .with_context(|| format!("couldn't load {}; build wasminstance first", WASM_PATH))?;
     let mut store = Store::new(&context.engine, context.clone());
     let mut linker = Linker::new(&context.engine);
-    linker.func_wrap("env", "log_str", |caller: Caller<'_, HostContext>, ptr, len| {
-        log_str(caller, ptr, len)
-    })?;
+    linker.func_wrap("env", "log_str", log_str)?;
     linker.func_wrap("env", "send_message", send_message)?;
+    linker.func_wrap("env", "set_timer", set_timer)?;
+    linker.func_wrap("env", "random_between", random_between)?;
+    linker.func_wrap("env", "report_leader", report_leader)?;
+    linker.func_wrap("env", "report_applied", report_applied)?;
 
-    // let wasm_instance = spawn_instance(&mut store, &linker, &module)?;
-    for _ in 1..=4 {
+    println!("{}\n", HELP);
+    // Servers get ids 1..=num_servers; the instance after them is the client.
+    for _ in 0..=num_servers {
         spawn_instance(&mut store, &linker, &module)?;
     }
 
-    // Make instance #1 leader, ideally can be chosen at random in the future
-    // as long as we can remember who it is
-    let leader_instance ={
-        let mut state = context.state.lock().unwrap();
-        state.instances.get_mut(&1).unwrap().instance
-    };
-    let make_leader_host = leader_instance.get_func(&mut store, "make_leader_host")
-        .expect("make_leader_host function not found");
-    let make_leader_host = make_leader_host.typed::<(), ()>(&mut store)
-        .expect("make_leader_host function call failed");
-    make_leader_host.call(&mut store, ())?;
+    let commands = spawn_command_reader();
+    run_simulation(&mut store, commands);
 
-    // Make the last instance spawned as the client who
-    // issues enqueue, dequeue requests
-    let client_id = {
-        let mut state = context.state.lock().unwrap();
-        state.counter as i32
-    };
-    println!("Client ID: {:?}", client_id);
-    let client = {
-        let mut state = context.state.lock().unwrap();
-        state.instances.get_mut(&client_id).unwrap().instance
-    };
-    let client_enqueue = client.get_func(&mut store, "client_enqueue")
-        .expect("client_enqueue function not found");
-    let client_enqueue = client_enqueue.typed::<(i32, i32, i32), ()>(&mut store)
-        .expect("client_enqueue function call failed");
-    client_enqueue.call(&mut store, (111, 1, client_id))?;
-
-    thread::spawn({
-        move || {
-            handle_send_recv(store);
-        }
-    }).join().unwrap();
-
+    let state = context.state.lock().unwrap();
+    state.print("host", &state.safety.summary());
     Ok(())
 }
 
 
-fn log_str(mut caller: Caller<'_, HostContext>, ptr: i32, len: i32) {
-    let mem = match caller.get_export("memory") {
-        Some(Extern::Memory(mem)) => mem,
-        _ => {
-            println!("failed to find `memory` export");
-            return;
-        },
+/// The id of the instance calling into the host.
+fn caller_id(caller: &mut Caller<'_, HostContext>) -> i32 {
+    let Some(Extern::Func(get_instance)) = caller.get_export("get_instance") else {
+        return -1;
     };
-    let data = mem.data(&caller)
-        .get(ptr as u32 as usize..)
-        .and_then(|arr| arr.get(..len as u32 as usize));
-    let string = match data {
-        Some(data) => str::from_utf8(data).unwrap_or("invalid utf-8"),
-        None => "pointer/length out of bounds",
+    get_instance.typed::<(), i32>(&*caller)
+        .and_then(|get_instance| get_instance.call(&mut *caller, ()))
+        .unwrap_or(-1)
+}
+
+fn read_string(caller: &mut Caller<'_, HostContext>, ptr: i32, len: i32) -> Option<String> {
+    let Some(Extern::Memory(memory)) = caller.get_export("memory") else {
+        return None;
     };
-    println!("--> From wasm: {}", string);
+    let bytes = memory.data(&*caller)
+        .get(ptr as u32 as usize..)?
+        .get(..len as u32 as usize)?;
+    Some(String::from_utf8_lossy(bytes).into_owned())
+}
+
+fn log_str(mut caller: Caller<'_, HostContext>, level: i32, ptr: i32, len: i32) {
+    let id = caller_id(&mut caller);
+    let message = read_string(&mut caller, ptr, len)
+        .unwrap_or_else(|| "pointer/length out of bounds".to_string());
+    let state = caller.data().state.lock().unwrap();
+    if level < LOG_DEBUG || state.verbose {
+        state.print(&state.label(id), &message);
+    }
 }
 
 fn get_epoch_ms() -> u128 {
-    // println!("Getting epoch ms");
-    // Get the current time in milliseconds since the UNIX epoch
-    let time = SystemTime::now()
+    SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
-        .as_millis();
-    // println!("Current time in milliseconds: {:?}", time);
-    time
+        .as_millis()
 }
 
 pub fn send_message(mut caller: Caller<'_, HostContext>, target_id: i32, msg_ptr: i32, msg_len: i32) {
-    let memory = match caller.get_export("memory") {
-        Some(Extern::Memory(mem)) => mem,
-        _ => {
-            println!("failed to find `memory` export");
-            return;
-        },
+    let instance_id = caller_id(&mut caller);
+    let Some(message) = read_string(&mut caller, msg_ptr, msg_len) else {
+        return;
     };
-    let get_instance = match caller.get_export("get_instance") {
-        Some(Extern::Func(func)) => func,
-        _ => {
-            println!("failed to find `get_instance` export");
-            return;
-        },
-    };
-    let get_instance = get_instance.typed::<(), i32>(&caller).unwrap();
-    let instance_id = get_instance.call(&mut caller, ()).unwrap();
-    println!("Instance ID: {:?} sending message to {:?}", instance_id, target_id);
-    let message = memory.data(&caller)
-        .get(msg_ptr as usize..)
-        .and_then(|arr| arr.get(..msg_len as usize))
-        .map(|s| String::from_utf8_lossy(s).to_string());
-    if let Some(message) = message {
-        
-        let context = caller.data().clone();
-        // let state = context.state.clone();
-        let mut state = context.state.lock().unwrap();
-        println!("Message to send: {:?}", message);
-        let delay = {
-            let devil_cat = &state.devil_cat; // Immutable borrow
-            devil_cat.get_random_delay()
-        };
-        
-        if let Some(wasm_instance) = state.instances.get_mut(&target_id) {
-            let sender = &wasm_instance.sender;
-            let event = Event::new(get_epoch_ms() + delay, instance_id, EventData::RawMessage { message: message.clone() });
-            println!("Message sent to instance {}: {:?}", target_id, event);
-            sender.send(event).unwrap();
+    let state = caller.data().state.lock().unwrap();
+    let route = format!("{} -> {}", state.label(instance_id), state.label(target_id));
+    match state.instances.get(&target_id) {
+        Some(wasm_instance) if wasm_instance.alive => {
+            let delay = state.devil_cat.get_random_delay();
+            if state.verbose {
+                state.print("net", &format!("{} in {}ms: {}", route, delay, message));
+            }
+            let event = Event::new(get_epoch_ms() + delay, instance_id, EventData::RawMessage { message });
+            wasm_instance.sender.send(event).unwrap();
         }
+        Some(_) => {
+            if state.verbose {
+                state.print("net", &format!("{} lost, target is down: {}", route, message));
+            }
+        }
+        None => state.print("net", &format!("{} lost, no such node", route)),
+    }
+}
+
+/// Schedules `on_timer(token)` on the calling instance. Timers skip the network delay.
+fn set_timer(mut caller: Caller<'_, HostContext>, token: i32, delay_ms: i32) {
+    let instance_id = caller_id(&mut caller);
+    let state = caller.data().state.lock().unwrap();
+    if let Some(wasm_instance) = state.instances.get(&instance_id) {
+        let event = Event::new(get_epoch_ms() + delay_ms.max(0) as u128, instance_id, EventData::Timer { token });
+        wasm_instance.sender.send(event).unwrap();
+    }
+}
+
+fn random_between(min: i32, max: i32) -> i32 {
+    if min >= max { min } else { rand::thread_rng().gen_range(min..=max) }
+}
+
+fn report_leader(mut caller: Caller<'_, HostContext>, term: i32) {
+    let instance_id = caller_id(&mut caller);
+    let mut state = caller.data().state.lock().unwrap();
+    if let Some(problem) = state.safety.record_leader(term, instance_id) {
+        state.print("SAFETY", &format!("VIOLATION: {}", problem));
+    }
+}
+
+fn report_applied(mut caller: Caller<'_, HostContext>, index: i32, term: i32) {
+    let instance_id = caller_id(&mut caller);
+    let mut state = caller.data().state.lock().unwrap();
+    if let Some(problem) = state.safety.record_applied(index, term, instance_id) {
+        state.print("SAFETY", &format!("VIOLATION: {}", problem));
     }
 }

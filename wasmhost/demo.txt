@@ -1,0 +1,21 @@
+# Leader failover demo: cargo run < demo.txt
+# Wait for the first election, write some values, then kill the leader.
+sleep 4000
+enq 1
+enq 2
+enq 3
+sleep 2000
+status
+kill leader
+# The followers stop hearing heartbeats and elect a new leader. The client
+# times out on the dead leader and finds the new one.
+sleep 6000
+enq 4
+deq
+sleep 3000
+status
+# The old leader comes back as a follower and catches up.
+revive all
+sleep 3000
+status
+quit
