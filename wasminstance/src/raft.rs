@@ -39,8 +39,8 @@ pub struct InstanceState {
     election_deadline: i32,
     heartbeat_deadline: i32,
 
-    // Persistent state (Figure 2). There's no disk: it stays in wasm memory,
-    // which survives `kill`, so `restart` behaves as if it had been saved.
+    // Persistent state (Figure 2). There's no disk: `kill` only freezes a
+    // server, so everything here stays in its memory.
     current_term: i32,
     voted_for: Option<i32>,
     // log[0] is a sentinel, so the first real entry has index 1.
@@ -130,44 +130,6 @@ impl InstanceState {
         } else if self.now >= self.election_deadline {
             self.start_election();
         }
-    }
-
-    /// Called when the host revives a killed server. Volatile state is lost in
-    /// a crash; the term, vote and log were "persisted" and are kept.
-    pub fn restart(&mut self, now_ms: i32) {
-        self.now = now_ms;
-        self.role = Role::Follower;
-        self.current_leader = None;
-        self.votes_received.clear();
-        self.next_index.clear();
-        self.match_index.clear();
-        // The state machine is rebuilt by replaying the log once the leader
-        // tells us how much of it is committed.
-        self.commit_index = 0;
-        self.last_applied = 0;
-        self.queue.clear();
-        self.last_request = None;
-        log(&format!(
-            "restarted as follower in term {} with {} log entries",
-            self.current_term,
-            self.last_log_index(),
-        ));
-        self.reset_election_timer();
-    }
-
-    pub fn status(&self) -> String {
-        let terms: Vec<String> = self.log[1..].iter().map(|entry| entry.term.to_string()).collect();
-        format!(
-            "{:?} term={} leader={:?} voted_for={:?} commit={} applied={} queue={:?} log terms=[{}]",
-            self.role,
-            self.current_term,
-            self.current_leader,
-            self.voted_for,
-            self.commit_index,
-            self.last_applied,
-            self.queue,
-            terms.join(" "),
-        )
     }
 
     // Leader election (§5.2)
@@ -739,23 +701,17 @@ mod tests {
         send(&mut server, 1, append(1, 0, 0, vec![], 0));
         server.receive(CLIENT_ID, b"DEQ 2");
         assert_eq!(client_replies(), vec!["NOT_LEADER 1 0", "NOT_LEADER 2 1"]);
-        assert!(server.status().starts_with("Follower term=1 leader=Some(1)"));
     }
 
     #[test]
-    fn restart_keeps_term_vote_and_log_but_replays_the_state_machine() {
+    fn a_server_revived_after_a_long_freeze_stands_for_election() {
         let mut server = InstanceState::new(2, 3);
-        let request = ClientRequest { request_id: 1, operation: Operation::Enqueue, value: Some(9) };
-        send(&mut server, 1, append(1, 0, 0, vec![LogEntry::client_request(1, 1, &request)], 1));
-        assert_eq!(server.queue, VecDeque::from([9]));
-
-        server.restart(50_000);
-        assert_eq!((server.current_term, server.last_log_index()), (1, 1));
-        assert!(server.queue.is_empty());
-        // Timeouts count from the restart, not from the last tick before the kill.
-        server.tick(50_010);
-        assert_eq!(server.role, Role::Follower);
-        send(&mut server, 1, append(1, 1, 1, vec![], 1));
-        assert_eq!(server.queue, VecDeque::from([9]));
+        server.start();
+        send(&mut server, 1, append(1, 0, 0, vec![], 0));
+        server.tick(100);
+        // Killed for a minute: no ticks, so the next one is long past the deadline.
+        server.tick(60_100);
+        assert_eq!(server.role, Role::Candidate);
+        assert_eq!(server.current_term, 2);
     }
 }

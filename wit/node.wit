@@ -5,6 +5,10 @@ package wasm-world:raft;
 ///
 /// Servers have ids 1..cluster-size. Id 0 is the client. The client
 /// protocol is plain text; see STUDENTS.md.
+///
+/// The host can kill a server and later revive it. A killed server is
+/// frozen: it gets no ticks, messages to it are lost, and when revived it
+/// carries on where it stopped.
 world node {
   /// Sends bytes to server `to`, or to 0 to answer the client. Messages
   /// between servers can use any format: the host only forwards them. They
@@ -35,15 +39,7 @@ world node {
   export receive: func(sender: s32, data: list<u8>);
 
   /// Called every 10 ms. `now-ms` is the time since the cluster started,
-  /// and is the only clock to use for timeouts.
+  /// and is the only clock to use for timeouts. It jumps ahead when a
+  /// killed server is revived.
   export tick: func(now-ms: s32);
-
-  /// Called when a killed server is revived, then ticks resume. Its memory
-  /// is kept, standing in for disk: reset what Raft calls volatile state,
-  /// and restart timeouts from `now-ms`. Ticks stop while a server is down,
-  /// so the time of its last tick is out of date.
-  export restart: func(now-ms: s32);
-
-  /// Called on the host's `status` command. Log your state, or do nothing.
-  export status: func();
 }

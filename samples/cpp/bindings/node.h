@@ -41,8 +41,6 @@ extern void node_report_applied(int32_t index, int32_t term);
 void exports_node_start(int32_t id, int32_t cluster_size);
 void exports_node_receive(int32_t sender, node_list_u8_t *data);
 void exports_node_tick(int32_t now_ms);
-void exports_node_restart(int32_t now_ms);
-void exports_node_status(void);
 
 // Helper Functions
 

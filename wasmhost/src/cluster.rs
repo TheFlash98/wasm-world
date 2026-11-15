@@ -31,6 +31,11 @@ pub const CLIENT_ID: i32 = 0;
 const TICK_MS: u64 = 10;
 const CLIENT_RETRY_MS: u64 = 2000;
 const RECENT_LINES: usize = 400;
+// Log lines kept from just before the first violation, to explain a failure.
+const CONTEXT_LINES: usize = 25;
+// Wasm frames shown for a trap. The innermost few say where it happened;
+// the rest are usually the language runtime's internals.
+const TRAP_FRAMES: usize = 4;
 
 /// What each server's store holds. Calls from the guest land here, and the
 /// cluster picks them up after every call into the guest.
@@ -251,6 +256,19 @@ impl Log {
     }
 }
 
+/// What a trap was, and the innermost wasm frames to show where it happened.
+fn describe_trap(error: &wasmtime::Error) -> Vec<String> {
+    let mut lines = vec![format!("trapped: {}", error.root_cause())];
+    if let Some(backtrace) = error.downcast_ref::<wasmtime::WasmBacktrace>() {
+        for frame in backtrace.frames().iter().take(TRAP_FRAMES) {
+            let module = frame.module().name().unwrap_or("<unknown>");
+            let function = frame.func_name().unwrap_or("<unknown>");
+            lines.push(format!("    at {}!{}", module, function));
+        }
+    }
+    lines
+}
+
 fn label(id: i32) -> String {
     if id == CLIENT_ID { "client".to_string() } else { format!("node {}", id) }
 }
@@ -267,8 +285,11 @@ pub struct Cluster {
     client: Client,
     leaders: BTreeMap<i32, i32>, // term -> the node that reported leading it
     applied: BTreeMap<i32, (i32, i32)>, // log index -> (term, node) of the first report
+    applied_through: BTreeMap<i32, i32>, // node -> highest log index it has applied
     last_answered_by: Option<i32>,
     violations: Vec<String>,
+    // The log lines leading up to the first violation.
+    first_violation_context: Vec<String>,
     pub log: Log,
 }
 
@@ -346,8 +367,10 @@ impl Cluster {
             },
             leaders: BTreeMap::new(),
             applied: BTreeMap::new(),
+            applied_through: BTreeMap::new(),
             last_answered_by: None,
             violations: Vec::new(),
+            first_violation_context: Vec::new(),
             log: Log { echo, verbose: false, recent: VecDeque::new() },
         };
         for id in 1..=num_servers {
@@ -474,8 +497,6 @@ impl Cluster {
         }
         server.alive = true;
         self.print("host", &format!("node {} revived", id));
-        let now = self.now() as i32;
-        self.call(id, |node, store| node.call_restart(store, now));
         Ok(())
     }
 
@@ -483,13 +504,20 @@ impl Cluster {
         self.servers.iter().filter(|(_, server)| !server.alive).map(|(&id, _)| id).collect()
     }
 
+    /// What the host knows about each node: whether it's up, and what it has
+    /// reported through `report-leader` and `report-applied`.
     pub fn status(&mut self) {
         for id in 1..=self.num_servers {
-            if self.is_alive(id) {
-                self.call(id, |node, store| node.call_status(store));
-            } else {
-                self.print(&label(id), "DOWN");
+            let server = &self.servers[&id];
+            let state = if server.crashed { "CRASHED" } else if server.alive { "up" } else { "DOWN" };
+            let mut parts = vec![state.to_string()];
+            if let Some((term, _)) = self.leaders.iter().rev().find(|&(_, &leader)| leader == id) {
+                parts.push(format!("last led term {}", term));
             }
+            if let Some(index) = self.applied_through.get(&id) {
+                parts.push(format!("applied through #{}", index));
+            }
+            self.print(&label(id), &parts.join(", "));
         }
         let client = match self.oldest_pending() {
             Some((request_id, op, waited)) => {
@@ -517,7 +545,20 @@ impl Cluster {
 
     fn violation(&mut self, problem: String) {
         self.print("CHECK", &format!("VIOLATION: {}", problem));
+        if self.violations.is_empty() {
+            self.first_violation_context = self.log.recent(CONTEXT_LINES).cloned().collect();
+        }
         self.violations.push(problem);
+    }
+
+    /// The log lines that best explain a failure: those leading up to the
+    /// first violation, or else the most recent ones.
+    pub fn failure_context(&self) -> Vec<String> {
+        if self.first_violation_context.is_empty() {
+            self.log.recent(CONTEXT_LINES).cloned().collect()
+        } else {
+            self.first_violation_context.clone()
+        }
     }
 
     /// Calls into a live node, then handles what it did: messages, log lines,
@@ -542,7 +583,7 @@ impl Cluster {
         if let Err(error) = &result {
             server.alive = false;
             server.crashed = true;
-            printed.extend(format!("{:#}", error).lines().map(str::to_string));
+            printed.extend(describe_trap(error));
         }
 
         let who = label(id);
@@ -559,6 +600,8 @@ impl Cluster {
             }
         }
         for (index, term) in applied {
+            let through = self.applied_through.entry(id).or_insert(index);
+            *through = (*through).max(index);
             let (first_term, first_node) = *self.applied.entry(index).or_insert((term, id));
             if first_term != term {
                 self.violation(format!(

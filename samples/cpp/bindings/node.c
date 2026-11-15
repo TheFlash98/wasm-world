@@ -25,8 +25,6 @@ extern void __wasm_import_node_report_applied(int32_t, int32_t);
 
 
 
-
-
 // Canonical ABI intrinsics
 
 __attribute__((__weak__, __export_name__("cabi_realloc")))
@@ -112,16 +110,6 @@ void __wasm_export_exports_node_receive(int32_t arg, uint8_t * arg0, size_t arg1
 __attribute__((__export_name__("tick")))
 void __wasm_export_exports_node_tick(int32_t arg) {
   exports_node_tick(arg);
-}
-
-__attribute__((__export_name__("restart")))
-void __wasm_export_exports_node_restart(int32_t arg) {
-  exports_node_restart(arg);
-}
-
-__attribute__((__export_name__("status")))
-void __wasm_export_exports_node_status(void) {
-  exports_node_status();
 }
 
 // Ensure that the *_component_type.o object is linked in

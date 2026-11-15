@@ -26,9 +26,9 @@ const HELP: &str = "\
 commands:
   enq <n>             the client enqueues n
   deq                 the client dequeues
-  kill <id|leader>    crash a server; messages to it are lost
-  revive <id|all>     restart crashed servers (they keep their memory)
-  status              show every node's state
+  kill <id|leader>    freeze a server; messages to it are lost
+  revive <id|all>     unfreeze killed servers
+  status              show which servers are up and what they've reported
   verbose on|off      also show every message
   delay <min> <max>   set the network delay range in ms
   loss <percent>      lose this share of messages

@@ -139,36 +139,6 @@ public:
         }
     }
 
-    // Called when the host revives a killed server. Volatile state is lost in
-    // a crash; the term, vote and log were "persisted" and are kept.
-    void restart(int now_ms) {
-        now_ = now_ms;
-        role_ = Role::Follower;
-        leader_ = 0;
-        votes_.clear();
-        next_index_.clear();
-        match_index_.clear();
-        // The queue is rebuilt by replaying the log once the leader tells us
-        // how much of it is committed.
-        commit_index_ = 0;
-        last_applied_ = 0;
-        queue_.clear();
-        last_request_id_ = 0;
-        last_reply_.clear();
-        log("restarted as follower in term " + num(current_term_) + " with " + num(last_log_index()) + " log entries");
-        reset_election_timer();
-    }
-
-    void status() {
-        static const char* roles[] = {"Follower", "Candidate", "Leader"};
-        std::string queue, terms;
-        for (int value : queue_) queue += (queue.empty() ? "" : " ") + num(value);
-        for (size_t i = 1; i < log_.size(); i++) terms += (i == 1 ? "" : " ") + num(log_[i].term);
-        log(std::string(roles[(int)role_]) + " term=" + num(current_term_) + " leader=" + num(leader_) +
-            " voted_for=" + num(voted_for_) + " commit=" + num(commit_index_) + " applied=" + num(last_applied_) +
-            " queue=[" + queue + "] log terms=[" + terms + "]");
-    }
-
 private:
     // Leader election (§5.2)
 
@@ -427,7 +397,7 @@ private:
     int election_deadline_ = 0;
     int heartbeat_deadline_ = 0;
 
-    // Persistent state (Figure 2). It stays in wasm memory, which survives a kill.
+    // Persistent state (Figure 2). There's no disk: `kill` only freezes a server.
     int current_term_ = 0;
     int voted_for_ = 0;  // 0 when we haven't voted this term
     std::vector<Entry> log_;
@@ -467,12 +437,4 @@ void exports_node_receive(int32_t sender, node_list_u8_t* data) {
 
 void exports_node_tick(int32_t now_ms) {
     if (server) server->tick(now_ms);
-}
-
-void exports_node_restart(int32_t now_ms) {
-    if (server) server->restart(now_ms);
-}
-
-void exports_node_status(void) {
-    if (server) server->status();
 }

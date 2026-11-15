@@ -23,8 +23,6 @@ Servers have ids `1..cluster-size`. **Id 0 is the client.**
 | `start(id, cluster-size)` | once, first |
 | `receive(sender, data)` | a message arrived; `sender` 0 means the client |
 | `tick(now-ms)` | every 10 ms; `now-ms` is your only clock |
-| `restart(now-ms)` | a killed server is revived (see [Crashes](#crashes)) |
-| `status()` | the `status` command; log your state, or do nothing |
 
 **You can call these.**
 
@@ -80,17 +78,15 @@ its reply, is enough.
 - **Time:** use `now-ms` from `tick`. It's simulated: tests run much faster
   than real time, and the same seed always gives the same run.
 
-## Crashes
+## Killed servers
 
-`kill` stops a server: no ticks, and no messages in or out. There's no disk,
-but the server's memory is kept, standing in for Raft's persistent state.
-When it's revived, the host calls `restart(now-ms)`. Do two things there:
+`kill` freezes a server. It gets no ticks, and messages sent to it are lost.
+Its memory is kept, so there's no disk to deal with. When it's revived, it
+carries on where it stopped, with `now-ms` jumped ahead.
 
-- Reset Raft's volatile state. That's your role, commit index, last applied
-  index, the leader's per-follower indexes, and the queue. Then rebuild the
-  queue by replaying the log once you learn the commit index again.
-- Restart your election timeout from `now-ms`. The time of your last tick
-  is from before the crash.
+That's just like a server that was cut off from the network for a while.
+Raft handles it: the server's timeout has usually passed, so it starts an
+election at once. It loses that election if its log is behind.
 
 A server that traps (crashes, panics, aborts) stays down and fails the test.
 

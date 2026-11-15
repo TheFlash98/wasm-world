@@ -8,7 +8,6 @@ mod raft;
 mod component {
     use std::cell::RefCell;
 
-    use crate::host;
     use crate::raft::InstanceState;
 
     wit_bindgen::generate!({
@@ -45,14 +44,6 @@ mod component {
 
         fn tick(now_ms: i32) {
             with_instance(|instance| instance.tick(now_ms));
-        }
-
-        fn restart(now_ms: i32) {
-            with_instance(|instance| instance.restart(now_ms));
-        }
-
-        fn status() {
-            with_instance(|instance| host::log(&instance.status()));
         }
     }
 

@@ -7,8 +7,6 @@ use std::time::Instant;
 
 use crate::cluster::{Cluster, Loaded, Op};
 
-const LOG_LINES_ON_FAILURE: usize = 25;
-
 pub struct Scenario {
     pub name: &'static str,
     run: fn(&mut Cluster) -> Result<(), String>,
@@ -61,8 +59,8 @@ pub fn run(loaded: &Loaded, module: &str, num_servers: i32, seed: u64, only: Opt
             }
             Some(reason) => {
                 println!("  FAIL  {}. {}\n        {}", number, scenario.name, reason);
-                println!("        last log lines:");
-                for line in cluster.log.recent(LOG_LINES_ON_FAILURE) {
+                println!("        log leading up to it:");
+                for line in cluster.failure_context() {
                     println!("          {}", line);
                 }
                 println!(
@@ -238,7 +236,7 @@ fn stale_server_loses(cluster: &mut Cluster) -> Result<(), String> {
     Ok(())
 }
 
-/// Random crashes and restarts under steady traffic. Killing the leader just
+/// Random kills and revivals under steady traffic. Killing the leader just
 /// after a request leaves uncommitted entries behind, so logs diverge and
 /// have to be repaired many times over.
 fn chaos(cluster: &mut Cluster) -> Result<(), String> {
