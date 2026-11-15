@@ -1,11 +1,13 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use crate::host::{self, debug, log};
+use crate::host::{self, log};
 use crate::messages::{
-    AppendEntryRequest, AppendEntryResponse, ClientRequest, ClientResponse, ClientResult, Events,
+    not_leader_reply, AppendEntryRequest, AppendEntryResponse, ClientRequest, ClientResult, Events,
     LogEntry, Operation, VoteRequest, VoteResponse,
 };
-use crate::Actor;
+
+// The host plays the client, at id 0.
+const CLIENT_ID: i32 = 0;
 
 // The host delays each message by 10-150 ms by default. Elections only work
 // if a round trip is well under the election timeout (§5.6), and the heartbeat
@@ -32,11 +34,10 @@ pub struct InstanceState {
     min_election_timeout: i32,
     max_election_timeout: i32,
     heartbeat_timeout: i32,
-    // Tokens of the latest timers. The host calls `on_timer(token)` when a
-    // timer fires; a token that no longer matches was reset and is ignored.
-    election_timer: i32,
-    heartbeat_timer: i32,
-    next_timer_token: i32,
+    // Times from the host's clock, which only moves forward in `tick`.
+    now: i32,
+    election_deadline: i32,
+    heartbeat_deadline: i32,
 
     // Persistent state (Figure 2). There's no disk: it stays in wasm memory,
     // which survives `kill`, so `restart` behaves as if it had been saved.
@@ -52,58 +53,10 @@ pub struct InstanceState {
     next_index: HashMap<i32, i32>,
     match_index: HashMap<i32, i32>,
 
-    // The replicated state machine: the queue, plus each client's latest
+    // The replicated state machine: the queue, plus the client's latest
     // request and result so a retried request isn't applied twice (§8).
     queue: VecDeque<i32>,
-    client_sessions: HashMap<i32, (i32, ClientResult)>,
-}
-
-impl Actor for InstanceState {
-    fn init(&mut self) {
-        log(&format!("server up as follower, cluster {:?}", self.view));
-        self.reset_election_timer();
-    }
-
-    fn receive(&mut self, sender: i32, event: Events) {
-        // Rule for all servers: a newer term means we're out of date, so follow it.
-        if let Some(term) = event.term() {
-            if term > self.current_term {
-                self.step_down(term);
-            }
-        }
-        match event {
-            Events::VoteRequest(req) => self.handle_vote_request(sender, req),
-            Events::VoteResponse(resp) => self.handle_vote_response(sender, resp),
-            Events::AppendEntryRequest(req) => self.handle_append_entries(sender, req),
-            Events::AppendEntryResponse(resp) => self.handle_append_entries_response(sender, resp),
-            Events::ClientRequest(req) => self.handle_client_request(sender, req),
-            Events::ClientResponse(resp) => debug(&format!("ignoring {:?} from {}", resp, sender)),
-        }
-    }
-
-    fn on_timer(&mut self, token: i32) {
-        if token == self.election_timer && self.role != Role::Leader {
-            self.start_election();
-        } else if token == self.heartbeat_timer && self.role == Role::Leader {
-            self.broadcast_append_entries();
-            self.reset_heartbeat_timer();
-        }
-    }
-
-    fn status(&self) -> String {
-        let terms: Vec<String> = self.log[1..].iter().map(|entry| entry.term.to_string()).collect();
-        format!(
-            "{:?} term={} leader={:?} voted_for={:?} commit={} applied={} queue={:?} log terms=[{}]",
-            self.role,
-            self.current_term,
-            self.current_leader,
-            self.voted_for,
-            self.commit_index,
-            self.last_applied,
-            self.queue,
-            terms.join(" "),
-        )
-    }
+    last_request: Option<(i32, ClientResult)>,
 }
 
 impl InstanceState {
@@ -116,9 +69,9 @@ impl InstanceState {
             min_election_timeout: MIN_ELECTION_TIMEOUT_MS,
             max_election_timeout: MAX_ELECTION_TIMEOUT_MS,
             heartbeat_timeout: HEARTBEAT_TIMEOUT_MS,
-            election_timer: 0,
-            heartbeat_timer: 0,
-            next_timer_token: 0,
+            now: 0,
+            election_deadline: 0,
+            heartbeat_deadline: 0,
             current_term: 0,
             voted_for: None,
             log: vec![LogEntry::empty()],
@@ -128,13 +81,61 @@ impl InstanceState {
             next_index: HashMap::new(),
             match_index: HashMap::new(),
             queue: VecDeque::new(),
-            client_sessions: HashMap::new(),
+            last_request: None,
+        }
+    }
+
+    pub fn start(&mut self) {
+        log(&format!("server up as follower, cluster {:?}", self.view));
+        self.reset_election_timer();
+    }
+
+    pub fn receive(&mut self, sender: i32, data: &[u8]) {
+        if sender == CLIENT_ID {
+            match ClientRequest::parse(data) {
+                Some(request) => self.handle_client_request(request),
+                None => log(&format!("ignoring bad client request {:?}", String::from_utf8_lossy(data))),
+            }
+            return;
+        }
+        let event = std::str::from_utf8(data)
+            .map_err(|err| err.to_string())
+            .and_then(|text| ron::from_str::<Events>(text).map_err(|err| err.to_string()));
+        let event = match event {
+            Ok(event) => event,
+            Err(err) => {
+                log(&format!("dropping unreadable message from {}: {}", sender, err));
+                return;
+            }
+        };
+        // Rule for all servers: a newer term means we're out of date, so follow it.
+        if event.term() > self.current_term {
+            self.step_down(event.term());
+        }
+        match event {
+            Events::VoteRequest(req) => self.handle_vote_request(sender, req),
+            Events::VoteResponse(resp) => self.handle_vote_response(sender, resp),
+            Events::AppendEntryRequest(req) => self.handle_append_entries(sender, req),
+            Events::AppendEntryResponse(resp) => self.handle_append_entries_response(sender, resp),
+        }
+    }
+
+    pub fn tick(&mut self, now_ms: i32) {
+        self.now = now_ms;
+        if self.role == Role::Leader {
+            if self.now >= self.heartbeat_deadline {
+                self.broadcast_append_entries();
+                self.reset_heartbeat_timer();
+            }
+        } else if self.now >= self.election_deadline {
+            self.start_election();
         }
     }
 
     /// Called when the host revives a killed server. Volatile state is lost in
     /// a crash; the term, vote and log were "persisted" and are kept.
-    pub fn restart(&mut self) {
+    pub fn restart(&mut self, now_ms: i32) {
+        self.now = now_ms;
         self.role = Role::Follower;
         self.current_leader = None;
         self.votes_received.clear();
@@ -145,7 +146,7 @@ impl InstanceState {
         self.commit_index = 0;
         self.last_applied = 0;
         self.queue.clear();
-        self.client_sessions.clear();
+        self.last_request = None;
         log(&format!(
             "restarted as follower in term {} with {} log entries",
             self.current_term,
@@ -154,9 +155,19 @@ impl InstanceState {
         self.reset_election_timer();
     }
 
-    /// The current term if this server is a leader, otherwise -1.
-    pub fn leader_term(&self) -> i32 {
-        if self.role == Role::Leader { self.current_term } else { -1 }
+    pub fn status(&self) -> String {
+        let terms: Vec<String> = self.log[1..].iter().map(|entry| entry.term.to_string()).collect();
+        format!(
+            "{:?} term={} leader={:?} voted_for={:?} commit={} applied={} queue={:?} log terms=[{}]",
+            self.role,
+            self.current_term,
+            self.current_leader,
+            self.voted_for,
+            self.commit_index,
+            self.last_applied,
+            self.queue,
+            terms.join(" "),
+        )
     }
 
     // Leader election (§5.2)
@@ -247,7 +258,7 @@ impl InstanceState {
                 self.reset_election_timer();
             }
             Role::Candidate => log(&format!("saw term {}, giving up on term {}", term, self.current_term)),
-            Role::Follower => debug(&format!("moving from term {} to {}", self.current_term, term)),
+            Role::Follower => {}
         }
         self.current_term = term;
         self.voted_for = None;
@@ -279,12 +290,10 @@ impl InstanceState {
 
         // Our log must already hold the entry just before the new ones.
         if req.prev_log_index > self.last_log_index() {
-            debug(&format!("missing entry {}, log ends at {}", req.prev_log_index, self.last_log_index()));
             self.reply_append_entries(sender, false, self.last_log_index());
             return;
         }
         if self.term_at(req.prev_log_index) != req.prev_log_term {
-            debug(&format!("entry {} has a different term than the leader's", req.prev_log_index));
             self.reply_append_entries(sender, false, req.prev_log_index - 1);
             return;
         }
@@ -297,7 +306,7 @@ impl InstanceState {
                     // Already have it, e.g. from a request that arrived out of order.
                     continue;
                 }
-                debug(&format!("dropping conflicting entries from index {}", index));
+                // A conflicting entry: drop it and everything after it.
                 self.log.truncate(index as usize);
             }
             self.log.push(entry);
@@ -381,18 +390,17 @@ impl InstanceState {
         }));
     }
 
-    // Clients and the state machine (§8)
+    // The client and the state machine (§8)
 
-    fn handle_client_request(&mut self, sender: i32, req: ClientRequest) {
+    fn handle_client_request(&mut self, req: ClientRequest) {
         if self.role != Role::Leader {
-            self.reply_client(sender, req.request_id, ClientResult::NotLeader(self.current_leader));
+            host::send_bytes(CLIENT_ID, not_leader_reply(req.request_id, self.current_leader).as_bytes());
             return;
         }
-        if let Some((last_request_id, result)) = self.client_sessions.get(&req.client_id) {
+        if let Some((last_request_id, result)) = &self.last_request {
             if *last_request_id == req.request_id {
                 // Already applied; the client just didn't get our answer.
-                let result = result.clone();
-                self.reply_client(sender, req.request_id, result);
+                host::send_bytes(CLIENT_ID, result.reply(req.request_id).as_bytes());
                 return;
             }
         }
@@ -411,45 +419,32 @@ impl InstanceState {
             host::report_applied(self.last_applied, entry.term);
             if self.role == Role::Leader {
                 log(&format!("committed #{} {}, queue now {:?}", self.last_applied, entry.describe(), self.queue));
-                if let Some((client_id, request_id, result)) = outcome {
-                    self.reply_client(client_id, request_id, result);
+                if let Some((request_id, result)) = outcome {
+                    host::send_bytes(CLIENT_ID, result.reply(request_id).as_bytes());
                 }
-            } else {
-                debug(&format!("applied #{} {}, queue now {:?}", self.last_applied, entry.describe(), self.queue));
             }
         }
     }
 
-    /// Runs one entry on the queue. Returns who to answer and with what.
-    fn apply(&mut self, entry: &LogEntry) -> Option<(i32, i32, ClientResult)> {
-        let (Some(client_id), Some(request_id)) = (entry.requester, entry.request_id) else {
-            return None;
-        };
-        if let Some((last_request_id, result)) = self.client_sessions.get(&client_id) {
+    /// Runs one entry on the queue. Returns the request it answers, if any.
+    fn apply(&mut self, entry: &LogEntry) -> Option<(i32, ClientResult)> {
+        let request_id = entry.request_id?;
+        if let Some((last_request_id, result)) = &self.last_request {
             if request_id <= *last_request_id {
                 // The same request was appended twice (the client retried). Don't redo it.
-                return (request_id == *last_request_id).then(|| (client_id, request_id, result.clone()));
+                return (request_id == *last_request_id).then(|| (request_id, result.clone()));
             }
         }
         let result = match entry.operation {
             Some(Operation::Enqueue) => {
-                let value = entry.arguments.unwrap_or_default();
-                self.queue.push_back(value);
-                ClientResult::Enqueued(value)
+                self.queue.push_back(entry.arguments.unwrap_or_default());
+                ClientResult::Enqueued
             }
             Some(Operation::Dequeue) => ClientResult::Dequeued(self.queue.pop_front()),
             _ => return None,
         };
-        self.client_sessions.insert(client_id, (request_id, result.clone()));
-        Some((client_id, request_id, result))
-    }
-
-    fn reply_client(&self, client_id: i32, request_id: i32, result: ClientResult) {
-        host::send(client_id, &Events::ClientResponse(ClientResponse {
-            client_id,
-            request_id,
-            result,
-        }));
+        self.last_request = Some((request_id, result.clone()));
+        Some((request_id, result))
     }
 
     // Helpers
@@ -483,20 +478,13 @@ impl InstanceState {
         }
     }
 
-    fn new_timer_token(&mut self) -> i32 {
-        self.next_timer_token += 1;
-        self.next_timer_token
-    }
-
     fn reset_election_timer(&mut self) {
-        self.election_timer = self.new_timer_token();
         let timeout = host::random_between(self.min_election_timeout, self.max_election_timeout);
-        host::set_timer(self.election_timer, timeout);
+        self.election_deadline = self.now + timeout;
     }
 
     fn reset_heartbeat_timer(&mut self) {
-        self.heartbeat_timer = self.new_timer_token();
-        host::set_timer(self.heartbeat_timer, self.heartbeat_timeout);
+        self.heartbeat_deadline = self.now + self.heartbeat_timeout;
     }
 }
 
@@ -505,12 +493,25 @@ mod tests {
     use super::*;
     use crate::host::mock;
 
-    fn sent() -> Vec<(i32, Events)> {
+    fn peer_messages() -> Vec<(i32, Events)> {
         mock::take()
             .sent
             .into_iter()
-            .map(|(to, msg)| (to, ron::from_str(&msg).unwrap()))
+            .map(|(to, data)| (to, ron::from_str(std::str::from_utf8(&data).unwrap()).unwrap()))
             .collect()
+    }
+
+    fn client_replies() -> Vec<String> {
+        mock::take()
+            .sent
+            .into_iter()
+            .filter(|(to, _)| *to == CLIENT_ID)
+            .map(|(_, data)| String::from_utf8(data).unwrap())
+            .collect()
+    }
+
+    fn send(server: &mut InstanceState, sender: i32, event: Events) {
+        server.receive(sender, ron::to_string(&event).unwrap().as_bytes());
     }
 
     fn entry(index: i32, term: i32) -> LogEntry {
@@ -544,25 +545,17 @@ mod tests {
         Events::AppendEntryResponse(AppendEntryResponse { term, log_index, success: true })
     }
 
-    fn enqueue(request_id: i32, value: i32) -> Events {
-        Events::ClientRequest(ClientRequest {
-            client_id: 4,
-            request_id,
-            operation: Operation::Enqueue,
-            value: Some(value),
-        })
-    }
-
-    /// Server 1 of 3, elected in the next term with node 2's vote.
+    /// Lets server 1 of 3 time out and win the election with node 2's vote.
     fn elect(server: &mut InstanceState) {
-        server.on_timer(server.election_timer);
-        server.receive(2, vote(server.current_term, true));
+        let now = server.election_deadline;
+        server.tick(now);
+        send(server, 2, vote(server.current_term, true));
         mock::take();
     }
 
     fn leader() -> InstanceState {
         let mut server = InstanceState::new(1, 3);
-        server.init();
+        server.start();
         elect(&mut server);
         server
     }
@@ -570,16 +563,18 @@ mod tests {
     #[test]
     fn election_timeout_starts_an_election_and_a_majority_wins() {
         let mut server = InstanceState::new(1, 3);
-        server.init();
-        server.on_timer(server.election_timer);
+        server.start();
+        server.tick(MIN_ELECTION_TIMEOUT_MS - 10);
+        assert_eq!(server.role, Role::Follower);
+        server.tick(MIN_ELECTION_TIMEOUT_MS);
         assert_eq!(server.role, Role::Candidate);
         assert_eq!(server.current_term, 1);
         assert_eq!(server.voted_for, Some(1));
-        let requests = sent();
+        let requests = peer_messages();
         assert_eq!(requests.len(), 2);
         assert!(matches!(requests[0], (2, Events::VoteRequest(VoteRequest { term: 1, candidate_id: 1, .. }))));
 
-        server.receive(2, vote(1, true));
+        send(&mut server, 2, vote(1, true));
         assert_eq!(server.role, Role::Leader);
         // The new leader appends a no-op for its term and sends it to both peers.
         assert_eq!(server.log[1].operation, Some(Operation::Nop));
@@ -589,22 +584,35 @@ mod tests {
     }
 
     #[test]
-    fn stale_timer_does_not_start_an_election() {
+    fn heartbeats_hold_off_an_election() {
         let mut server = InstanceState::new(2, 3);
-        server.init();
-        let stale = server.election_timer;
-        server.receive(1, append(1, 0, 0, vec![], 0));
-        server.on_timer(stale);
+        server.start();
+        for now in (0..10_000).step_by(100) {
+            if now % 1000 == 0 {
+                send(&mut server, 1, append(1, 0, 0, vec![], 0));
+            }
+            server.tick(now);
+        }
         assert_eq!(server.role, Role::Follower);
         assert_eq!(server.current_term, 1);
     }
 
     #[test]
+    fn leader_sends_heartbeats_on_tick() {
+        let mut server = leader();
+        let now = server.now;
+        server.tick(now + HEARTBEAT_TIMEOUT_MS);
+        let heartbeats = peer_messages();
+        assert_eq!(heartbeats.len(), 2);
+        assert!(heartbeats.iter().all(|(_, event)| matches!(event, Events::AppendEntryRequest(_))));
+    }
+
+    #[test]
     fn votes_once_per_term() {
         let mut server = InstanceState::new(1, 3);
-        server.receive(2, vote_request(1, 2, 0, 0));
-        server.receive(3, vote_request(1, 3, 0, 0));
-        let replies = sent();
+        send(&mut server, 2, vote_request(1, 2, 0, 0));
+        send(&mut server, 3, vote_request(1, 3, 0, 0));
+        let replies = peer_messages();
         assert!(matches!(replies[0], (2, Events::VoteResponse(VoteResponse { vote_granted: true, .. }))));
         assert!(matches!(replies[1], (3, Events::VoteResponse(VoteResponse { vote_granted: false, .. }))));
         assert_eq!(server.voted_for, Some(2));
@@ -616,16 +624,19 @@ mod tests {
         server.current_term = 2;
         server.log.push(entry(1, 2));
         // A newer term, but its last entry is from term 1 while ours is from term 2.
-        server.receive(2, vote_request(3, 2, 5, 1));
+        send(&mut server, 2, vote_request(3, 2, 5, 1));
         assert_eq!(server.current_term, 3);
         assert_eq!(server.voted_for, None);
-        assert!(matches!(sent()[..], [(2, Events::VoteResponse(VoteResponse { term: 3, vote_granted: false }))]));
+        assert!(matches!(
+            peer_messages()[..],
+            [(2, Events::VoteResponse(VoteResponse { term: 3, vote_granted: false }))]
+        ));
     }
 
     #[test]
     fn leader_steps_down_when_it_sees_a_newer_term() {
         let mut server = leader();
-        server.receive(3, vote_request(5, 3, 10, 5));
+        send(&mut server, 3, vote_request(5, 3, 10, 5));
         assert_eq!(server.role, Role::Follower);
         assert_eq!(server.current_term, 5);
         assert_eq!(server.voted_for, Some(3));
@@ -635,10 +646,10 @@ mod tests {
     fn rejects_append_when_log_is_too_short_and_says_where_it_ends() {
         let mut server = InstanceState::new(2, 3);
         server.log.push(entry(1, 1));
-        server.receive(1, append(1, 5, 1, vec![entry(6, 1)], 0));
+        send(&mut server, 1, append(1, 5, 1, vec![entry(6, 1)], 0));
         assert_eq!(server.last_log_index(), 1);
         assert!(matches!(
-            sent()[..],
+            peer_messages()[..],
             [(1, Events::AppendEntryResponse(AppendEntryResponse { success: false, log_index: 1, .. }))]
         ));
     }
@@ -649,20 +660,20 @@ mod tests {
         server.current_term = 2;
         server.log.extend([entry(1, 1), entry(2, 1), entry(3, 1)]);
         // A late request for index 1 must not cut off entries 2 and 3.
-        server.receive(1, append(2, 0, 0, vec![entry(1, 1)], 0));
+        send(&mut server, 1, append(2, 0, 0, vec![entry(1, 1)], 0));
         assert_eq!(terms(&server), vec![1, 1, 1]);
         // A different term at index 2 replaces entry 2 and everything after it.
-        server.receive(1, append(2, 1, 1, vec![entry(2, 2)], 0));
+        send(&mut server, 1, append(2, 1, 1, vec![entry(2, 2)], 0));
         assert_eq!(terms(&server), vec![1, 2]);
     }
 
     #[test]
     fn commit_index_never_moves_backwards() {
         let mut server = InstanceState::new(2, 3);
-        server.receive(1, append(1, 0, 0, vec![entry(1, 1), entry(2, 1), entry(3, 1)], 3));
+        send(&mut server, 1, append(1, 0, 0, vec![entry(1, 1), entry(2, 1), entry(3, 1)], 3));
         assert_eq!(server.commit_index, 3);
         // An older heartbeat that only proves the log matches up to index 1.
-        server.receive(1, append(1, 1, 1, vec![], 3));
+        send(&mut server, 1, append(1, 1, 1, vec![], 3));
         assert_eq!(server.commit_index, 3);
     }
 
@@ -673,9 +684,9 @@ mod tests {
         server.current_term = 1;
         server.log.push(entry(1, 1));
         elect(&mut server); // term 2, no-op at index 2
-        server.receive(2, append_ok(2, 1));
+        send(&mut server, 2, append_ok(2, 1));
         assert_eq!(server.commit_index, 0);
-        server.receive(2, append_ok(2, 2));
+        send(&mut server, 2, append_ok(2, 2));
         assert_eq!(server.commit_index, 2);
         assert_eq!(server.last_applied, 2);
         assert_eq!(mock::take().applied, vec![(1, 1), (2, 2)]);
@@ -685,10 +696,10 @@ mod tests {
     fn leader_backs_up_and_retries_after_a_rejection() {
         let mut server = leader();
         server.next_index.insert(2, 2);
-        server.receive(2, Events::AppendEntryResponse(AppendEntryResponse { term: 1, log_index: 0, success: false }));
+        send(&mut server, 2, Events::AppendEntryResponse(AppendEntryResponse { term: 1, log_index: 0, success: false }));
         assert_eq!(server.next_index[&2], 1);
         assert!(matches!(
-            sent()[..],
+            peer_messages()[..],
             [(2, Events::AppendEntryRequest(AppendEntryRequest { prev_log_index: 0, .. }))]
         ));
     }
@@ -696,52 +707,55 @@ mod tests {
     #[test]
     fn leader_answers_the_client_once_committed() {
         let mut server = leader();
-        server.receive(4, enqueue(1, 7));
-        assert!(sent().iter().all(|(to, _)| *to != 4));
-        server.receive(2, append_ok(1, 2));
+        server.receive(CLIENT_ID, b"ENQ 1 7");
+        assert!(client_replies().is_empty());
+        send(&mut server, 2, append_ok(1, 2));
         assert_eq!(server.queue, VecDeque::from([7]));
-        let replies = sent();
-        assert!(replies.iter().any(|(to, event)| *to == 4
-            && matches!(event, Events::ClientResponse(ClientResponse { result: ClientResult::Enqueued(7), .. }))));
+        server.receive(CLIENT_ID, b"DEQ 2");
+        send(&mut server, 2, append_ok(1, 3));
+        server.receive(CLIENT_ID, b"DEQ 3");
+        send(&mut server, 2, append_ok(1, 4));
+        assert_eq!(client_replies(), vec!["OK 1", "OK 2 7", "EMPTY 3"]);
     }
 
     #[test]
     fn retried_client_request_is_applied_once() {
         let mut server = leader();
-        server.receive(4, enqueue(1, 7));
-        server.receive(4, enqueue(1, 7)); // retry before the first one committed
+        server.receive(CLIENT_ID, b"ENQ 1 7");
+        server.receive(CLIENT_ID, b"ENQ 1 7"); // retry before the first one committed
         assert_eq!(server.last_log_index(), 3);
-        server.receive(2, append_ok(1, 3));
+        send(&mut server, 2, append_ok(1, 3));
         assert_eq!(server.queue, VecDeque::from([7]));
+        // A retry after it committed gets the same answer without a new entry.
+        server.receive(CLIENT_ID, b"ENQ 1 7");
+        assert_eq!(server.last_log_index(), 3);
+        assert_eq!(client_replies(), vec!["OK 1", "OK 1", "OK 1"]);
     }
 
     #[test]
     fn follower_points_client_at_the_leader() {
         let mut server = InstanceState::new(2, 3);
-        server.receive(1, append(1, 0, 0, vec![], 0));
-        mock::take();
-        server.receive(4, enqueue(1, 7));
-        assert!(matches!(
-            sent()[..],
-            [(4, Events::ClientResponse(ClientResponse { result: ClientResult::NotLeader(Some(1)), .. }))]
-        ));
+        server.receive(CLIENT_ID, b"DEQ 1");
+        send(&mut server, 1, append(1, 0, 0, vec![], 0));
+        server.receive(CLIENT_ID, b"DEQ 2");
+        assert_eq!(client_replies(), vec!["NOT_LEADER 1 0", "NOT_LEADER 2 1"]);
+        assert!(server.status().starts_with("Follower term=1 leader=Some(1)"));
     }
 
     #[test]
     fn restart_keeps_term_vote_and_log_but_replays_the_state_machine() {
         let mut server = InstanceState::new(2, 3);
-        server.receive(1, append(1, 0, 0, vec![LogEntry::client_request(1, 1, &ClientRequest {
-            client_id: 4,
-            request_id: 1,
-            operation: Operation::Enqueue,
-            value: Some(9),
-        })], 1));
+        let request = ClientRequest { request_id: 1, operation: Operation::Enqueue, value: Some(9) };
+        send(&mut server, 1, append(1, 0, 0, vec![LogEntry::client_request(1, 1, &request)], 1));
         assert_eq!(server.queue, VecDeque::from([9]));
 
-        server.restart();
+        server.restart(50_000);
         assert_eq!((server.current_term, server.last_log_index()), (1, 1));
         assert!(server.queue.is_empty());
-        server.receive(1, append(1, 1, 1, vec![], 1));
+        // Timeouts count from the restart, not from the last tick before the kill.
+        server.tick(50_010);
+        assert_eq!(server.role, Role::Follower);
+        send(&mut server, 1, append(1, 1, 1, vec![], 1));
         assert_eq!(server.queue, VecDeque::from([9]));
     }
 }

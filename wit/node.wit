@@ -1,0 +1,49 @@
+package wasm-world:raft;
+
+/// One Raft server. The host starts one instance per server, delivers
+/// messages between them, and plays the client.
+///
+/// Servers have ids 1..cluster-size. Id 0 is the client. The client
+/// protocol is plain text; see STUDENTS.md.
+world node {
+  /// Sends bytes to server `to`, or to 0 to answer the client. Messages
+  /// between servers can use any format: the host only forwards them. They
+  /// arrive after a random delay, maybe out of order, and never arrive if
+  /// either end is down.
+  import send-message: func(to: s32, data: list<u8>);
+
+  /// Prints a line, labelled with this node's id.
+  import log-str: func(message: string);
+
+  /// A random number between min and max, inclusive.
+  import random: func(min: s32, max: s32) -> s32;
+
+  /// Optional: call this when you become leader. The host then checks that
+  /// no term ever has two leaders.
+  import report-leader: func(term: s32);
+
+  /// Optional: call this each time you apply a log entry to the queue. The
+  /// host then checks that every server applies the same entry (the same
+  /// term) at each log index.
+  import report-applied: func(index: s32, term: s32);
+
+  /// Called once, before anything else.
+  export start: func(id: s32, cluster-size: s32);
+
+  /// A message arrived from server `sender`, or from the client if
+  /// `sender` is 0.
+  export receive: func(sender: s32, data: list<u8>);
+
+  /// Called every 10 ms. `now-ms` is the time since the cluster started,
+  /// and is the only clock to use for timeouts.
+  export tick: func(now-ms: s32);
+
+  /// Called when a killed server is revived, then ticks resume. Its memory
+  /// is kept, standing in for disk: reset what Raft calls volatile state,
+  /// and restart timeouts from `now-ms`. Ticks stop while a server is down,
+  /// so the time of its last tick is out of date.
+  export restart: func(now-ms: s32);
+
+  /// Called on the host's `status` command. Log your state, or do nothing.
+  export status: func();
+}

@@ -2,23 +2,11 @@
 // in `mock` instead, so the Raft logic can be tested without a host.
 use crate::messages::Events;
 
-const LOG_INFO: i32 = 0;
-const LOG_DEBUG: i32 = 1;
+pub use imp::{log, random_between, report_applied, report_leader, send_bytes};
 
-pub use imp::{random_between, report_applied, report_leader, set_timer};
-
-/// Always printed by the host.
-pub fn log(msg: &str) {
-    imp::log_at(LOG_INFO, msg);
-}
-
-/// Printed only when the host runs with `verbose on`.
-pub fn debug(msg: &str) {
-    imp::log_at(LOG_DEBUG, msg);
-}
-
+/// Sends a message to another server.
 pub fn send(target_id: i32, event: &Events) {
-    imp::send_str(target_id, ron::to_string(event).unwrap());
+    send_bytes(target_id, ron::to_string(event).unwrap().as_bytes());
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -28,43 +16,26 @@ use mock as imp;
 
 #[cfg(target_arch = "wasm32")]
 mod wasm {
-    mod ffi {
-        #[link(wasm_import_module = "env")]
-        extern "C" {
-            pub fn log_str(level: i32, ptr: i32, len: i32);
-            pub fn send_message(target_id: i32, ptr: i32, len: i32);
-            pub fn set_timer(token: i32, delay_ms: i32);
-            pub fn random_between(min: i32, max: i32) -> i32;
-            pub fn report_leader(term: i32);
-            pub fn report_applied(index: i32, term: i32);
-        }
+    use crate::component as bindings;
+
+    pub fn log(message: &str) {
+        bindings::log_str(message);
     }
 
-    pub fn log_at(level: i32, msg: &str) {
-        unsafe { ffi::log_str(level, msg.as_ptr() as i32, msg.len() as i32) }
-    }
-
-    pub fn send_str(target_id: i32, msg: String) {
-        unsafe { ffi::send_message(target_id, msg.as_ptr() as i32, msg.len() as i32) }
-    }
-
-    /// The host calls `on_timer(token)` after `delay_ms`.
-    pub fn set_timer(token: i32, delay_ms: i32) {
-        unsafe { ffi::set_timer(token, delay_ms) }
+    pub fn send_bytes(target_id: i32, data: &[u8]) {
+        bindings::send_message(target_id, data);
     }
 
     pub fn random_between(min: i32, max: i32) -> i32 {
-        unsafe { ffi::random_between(min, max) }
+        bindings::random(min, max)
     }
 
-    /// Lets the host check that each term has at most one leader.
     pub fn report_leader(term: i32) {
-        unsafe { ffi::report_leader(term) }
+        bindings::report_leader(term);
     }
 
-    /// Lets the host check that every node applies the same entry at each index.
     pub fn report_applied(index: i32, term: i32) {
-        unsafe { ffi::report_applied(index, term) }
+        bindings::report_applied(index, term);
     }
 }
 
@@ -74,8 +45,7 @@ pub mod mock {
 
     #[derive(Default)]
     pub struct Calls {
-        pub sent: Vec<(i32, String)>,
-        pub timers: Vec<(i32, i32)>,
+        pub sent: Vec<(i32, Vec<u8>)>,
         pub leaders: Vec<i32>,
         pub applied: Vec<(i32, i32)>,
     }
@@ -89,16 +59,12 @@ pub mod mock {
         CALLS.with(|calls| calls.take())
     }
 
-    pub fn log_at(_level: i32, msg: &str) {
-        println!("{}", msg);
+    pub fn log(message: &str) {
+        println!("{}", message);
     }
 
-    pub fn send_str(target_id: i32, msg: String) {
-        CALLS.with(|calls| calls.borrow_mut().sent.push((target_id, msg)));
-    }
-
-    pub fn set_timer(token: i32, delay_ms: i32) {
-        CALLS.with(|calls| calls.borrow_mut().timers.push((token, delay_ms)));
+    pub fn send_bytes(target_id: i32, data: &[u8]) {
+        CALLS.with(|calls| calls.borrow_mut().sent.push((target_id, data.to_vec())));
     }
 
     pub fn random_between(min: i32, _max: i32) -> i32 {

@@ -11,3 +11,6 @@
 .vscode/
 
 .env
+
+# Built samples
+samples/cpp/raft.wasm

@@ -4,9 +4,10 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-wasmtime = "19.0.0"
+wasmtime = "50.0.1"
+wasmtime-wasi = "50.0.1"
 anyhow = "1.0"
-ron = "0.8"
-serde = { version = "1.0", features = ["derive"] }
-lazy_static = "1.4.0"
 rand = "0.8"
+# For capturing each node's stdout; wasmtime-wasi already uses both.
+bytes = "1"
+tokio = { version = "1", features = ["io-util"] }

@@ -9,3 +9,7 @@ crate-type = ["cdylib"]
 [dependencies]
 ron = "0.8"
 serde = { version = "1.0", features = ["derive"] }
+
+# Only the wasm build talks to the host; native builds are for unit tests.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wit-bindgen = "0.63"

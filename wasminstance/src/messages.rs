@@ -12,7 +12,6 @@ pub struct LogEntry {
     pub index: i32,
     pub term: i32,
     pub operation: Option<Operation>,
-    pub requester: Option<i32>,
     pub request_id: Option<i32>,
     pub arguments: Option<i32>,
 }
@@ -24,7 +23,6 @@ impl LogEntry {
             index: 0,
             term: 0,
             operation: None,
-            requester: None,
             request_id: None,
             arguments: None,
         }
@@ -36,7 +34,6 @@ impl LogEntry {
             index,
             term,
             operation: Some(Operation::Nop),
-            requester: None,
             request_id: None,
             arguments: None,
         }
@@ -47,7 +44,6 @@ impl LogEntry {
             index,
             term,
             operation: Some(request.operation),
-            requester: Some(request.client_id),
             request_id: Some(request.request_id),
             arguments: request.value,
         }
@@ -62,6 +58,9 @@ impl LogEntry {
         }
     }
 }
+
+// Messages between servers. Only our own servers read these, so any format
+// works; this one is RON, a Rust serialization format.
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct VoteRequest {
@@ -96,16 +95,56 @@ pub struct AppendEntryResponse {
     pub success: bool,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug)]
+pub enum Events {
+    VoteRequest(VoteRequest),
+    VoteResponse(VoteResponse),
+    AppendEntryRequest(AppendEntryRequest),
+    AppendEntryResponse(AppendEntryResponse),
+}
+
+impl Events {
+    pub fn term(&self) -> i32 {
+        match self {
+            Events::VoteRequest(req) => req.term,
+            Events::VoteResponse(resp) => resp.term,
+            Events::AppendEntryRequest(req) => req.term,
+            Events::AppendEntryResponse(resp) => resp.term,
+        }
+    }
+}
+
+// The client protocol. The host is the client, and it speaks plain text
+// (see STUDENTS.md) so that servers in any language can parse it.
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct ClientRequest {
-    pub client_id: i32,
-    // Lets servers recognise a retried request and not apply it twice (§8).
+    // The host resends the same id when it retries, so a server can tell a
+    // retry from a new request and not apply it twice (§8).
     pub request_id: i32,
     pub operation: Operation,
     pub value: Option<i32>,
 }
 
 impl ClientRequest {
+    /// Parses `ENQ <request_id> <value>` or `DEQ <request_id>`.
+    pub fn parse(data: &[u8]) -> Option<Self> {
+        let text = std::str::from_utf8(data).ok()?;
+        match text.split_whitespace().collect::<Vec<_>>().as_slice() {
+            ["ENQ", request_id, value] => Some(ClientRequest {
+                request_id: request_id.parse().ok()?,
+                operation: Operation::Enqueue,
+                value: Some(value.parse().ok()?),
+            }),
+            ["DEQ", request_id] => Some(ClientRequest {
+                request_id: request_id.parse().ok()?,
+                operation: Operation::Dequeue,
+                value: None,
+            }),
+            _ => None,
+        }
+    }
+
     pub fn describe(&self) -> String {
         match self.operation {
             Operation::Enqueue => format!("enqueue {}", self.value.unwrap_or_default()),
@@ -115,40 +154,24 @@ impl ClientRequest {
     }
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum ClientResult {
-    Enqueued(i32),
+    Enqueued,
     Dequeued(Option<i32>),
-    // Sent by followers and candidates, with the leader if they know it.
-    NotLeader(Option<i32>),
 }
 
-#[derive(Serialize, Deserialize, Debug)]
-pub struct ClientResponse {
-    pub client_id: i32,
-    pub request_id: i32,
-    pub result: ClientResult,
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-pub enum Events {
-    VoteRequest(VoteRequest),
-    VoteResponse(VoteResponse),
-    AppendEntryRequest(AppendEntryRequest),
-    AppendEntryResponse(AppendEntryResponse),
-    ClientRequest(ClientRequest),
-    ClientResponse(ClientResponse),
-}
-
-impl Events {
-    /// The sender's term for messages between servers; client messages have none.
-    pub fn term(&self) -> Option<i32> {
+impl ClientResult {
+    /// The reply line: `OK <id>`, `OK <id> <value>` or `EMPTY <id>`.
+    pub fn reply(&self, request_id: i32) -> String {
         match self {
-            Events::VoteRequest(req) => Some(req.term),
-            Events::VoteResponse(resp) => Some(resp.term),
-            Events::AppendEntryRequest(req) => Some(req.term),
-            Events::AppendEntryResponse(resp) => Some(resp.term),
-            Events::ClientRequest(_) | Events::ClientResponse(_) => None,
+            ClientResult::Enqueued => format!("OK {}", request_id),
+            ClientResult::Dequeued(Some(value)) => format!("OK {} {}", request_id, value),
+            ClientResult::Dequeued(None) => format!("EMPTY {}", request_id),
         }
     }
+}
+
+/// The reply from a server that isn't the leader. `leader` is 0 if unknown.
+pub fn not_leader_reply(request_id: i32, leader: Option<i32>) -> String {
+    format!("NOT_LEADER {} {}", request_id, leader.unwrap_or(0))
 }
