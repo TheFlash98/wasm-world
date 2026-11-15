@@ -23,6 +23,7 @@ does four things:
 | `wasmhost/` | the host: interactive runs and `wasmhost test` |
 | `wasminstance/` | reference solution in Rust |
 | `samples/cpp/` | sample solution in C++ |
+| `samples/python/` | sample solution in Python |
 
 ## Build and run
 
@@ -36,7 +37,10 @@ cargo run --release -- --servers 5      # 5 servers
 cargo run --release < demo.txt          # scripted leader failover
 cargo run --release -- test             # the test scenarios
 cargo run --release -- test ../samples/cpp/raft.wasm
+cargo run --release -- test ../samples/python/raft.wasm
 ```
+
+The C++ and Python samples need building first. STUDENTS.md explains how.
 
 With no file given, the host runs the Rust reference solution.
 

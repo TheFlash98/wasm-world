@@ -6,8 +6,8 @@ a WebAssembly component. The host runs several copies of your server, carries
 messages between them over a simulated network, plays the client, and checks
 your answers.
 
-There are working samples to read: Rust in `wasminstance/` and C++ in
-`samples/cpp/`.
+There are working samples to read: Rust in `wasminstance/`, C++ in
+`samples/cpp/`, and Python in `samples/python/`.
 
 ## The interface
 
@@ -39,8 +39,8 @@ safety properties: one leader per term, and every server applying the same
 entry at each index. Without them, many bugs go unnoticed.
 
 Messages between your servers can use **any format**: the host never reads
-them. The samples show two choices: the C++ one sends text such as
-`VOTE 3 2 7 2`, and the Rust one uses a Rust serialization format.
+them. The samples show three choices: C++ sends text such as `VOTE 3 2 7 2`,
+Python sends JSON, and Rust uses a Rust serialization format.
 
 ## The client protocol
 
@@ -112,9 +112,25 @@ samples/cpp/build.sh      # -> samples/cpp/raft.wasm
 In C and C++, `receive` hands you ownership of `data`: free it with
 `node_list_u8_free`.
 
+**Python:** use [componentize-py](https://github.com/bytecodealliance/componentize-py).
+
+```bash
+pip install -r samples/python/requirements.txt
+samples/python/build.sh   # -> samples/python/raft.wasm
+```
+
+- Define `class WitWorld(wit_world.WitWorld)` with `start`, `receive` and
+  `tick` methods.
+- Import the host's functions from `wit_world`, for example
+  `from wit_world import send_message, log_str`.
+- `receive` gets `data` as `bytes`.
+- An uncaught exception crashes your server, and the test shows your
+  traceback.
+- The component bundles Python itself, so it's about 18 MB and takes a few
+  seconds to build.
+
 **Other languages:** anything that can build a component for `wit/node.wit`
-should work, such as Go via TinyGo or JavaScript via jco. Python can build
-one with `componentize-py`, but there's no sample or test for it yet.
+should work, such as Go via TinyGo or JavaScript via jco.
 
 ## Testing
 

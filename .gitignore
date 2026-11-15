@@ -14,3 +14,5 @@
 
 # Built samples
 samples/cpp/raft.wasm
+samples/python/raft.wasm
+__pycache__/
